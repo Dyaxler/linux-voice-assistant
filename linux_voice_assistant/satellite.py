@@ -15,7 +15,6 @@ from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ListEntitiesRequest,
     MediaPlayerCommandRequest,
     SubscribeHomeAssistantStatesRequest,
-    DisconnectRequest,
     SwitchCommandRequest,
     VoiceAssistantAnnounceFinished,
     VoiceAssistantAnnounceRequest,
@@ -48,6 +47,7 @@ from .util import call_all
 _LOGGER = logging.getLogger(__name__)
 
 PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
+
 
 class VoiceSatelliteProtocol(APIServer):
 
@@ -120,6 +120,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
+        self._pipeline_active = False
 
         self._disconnect_event = asyncio.Event()
 
@@ -148,6 +149,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_url = data.get("url")
             self._tts_played = False
             self._continue_conversation = False
+            self._pipeline_active = True
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
@@ -315,6 +317,10 @@ class VoiceSatelliteProtocol(APIServer):
             # Don't respond to wake words when muted (voice_assistant.stop behavior)
             return
 
+        if self._pipeline_active:
+            _LOGGER.debug("Ignoring wake word while pipeline is active")
+            return
+
         wake_word_phrase = wake_word.wake_word
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
         self.send_messages(
@@ -322,11 +328,14 @@ class VoiceSatelliteProtocol(APIServer):
         )
         self.duck()
         self._is_streaming_audio = True
+        self._pipeline_active = True
         self.state.tts_player.play(self.state.wakeup_sound)
 
     def stop(self) -> None:
         self.state.stop_word.is_active = False
         self.state.tts_player.stop()
+        self._continue_conversation = False
+        self._pipeline_active = False
 
         if self._timer_finished:
             self._timer_finished = False
@@ -346,22 +355,31 @@ class VoiceSatelliteProtocol(APIServer):
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
     def duck(self) -> None:
-        _LOGGER.debug("Ducking music")
+        _LOGGER.debug("Ducking audio output")
         self.state.music_player.duck()
+        if self.state.tts_player is not self.state.music_player and self.state.tts_player.is_playing:
+            self.state.tts_player.duck()
 
     def unduck(self) -> None:
-        _LOGGER.debug("Unducking music")
+        _LOGGER.debug("Unducking audio output")
         self.state.music_player.unduck()
+        if self.state.tts_player is not self.state.music_player:
+            self.state.tts_player.unduck()
 
     def _tts_finished(self) -> None:
         self.state.stop_word.is_active = False
         self.send_messages([VoiceAssistantAnnounceFinished()])
 
-        if self._continue_conversation:
+        continue_conversation = self._continue_conversation
+        self._continue_conversation = False
+
+        if continue_conversation:
             self.send_messages([VoiceAssistantRequest(start=True)])
             self._is_streaming_audio = True
+            self._pipeline_active = True
             _LOGGER.debug("Continuing conversation")
         else:
+            self._pipeline_active = False
             self.unduck()
 
         _LOGGER.debug("TTS response finished")
@@ -387,6 +405,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
+        self._pipeline_active = False
 
         # Stop any ongoing audio playback and wake/stop word processing.
         try:
