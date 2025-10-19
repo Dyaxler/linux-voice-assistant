@@ -1,3 +1,4 @@
+import logging
 from abc import abstractmethod
 from collections.abc import Iterable
 from typing import Callable, List, Optional, Union
@@ -19,6 +20,9 @@ from google.protobuf import message
 from .api_server import APIServer
 from .mpv_player import MpvMediaPlayer
 from .util import call_all
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class ESPHomeEntity:
@@ -106,14 +110,14 @@ class MediaPlayerEntity(ESPHomeEntity):
                 if msg.command == MediaPlayerCommand.PAUSE:
                     self.music_player.pause()
                     self.announce_player.pause()
-                    if self.music_player.player['idle-active'] and self.announce_player.player['idle-active']:
+                    if self._players_idle():
                         yield self._update_state(MediaPlayerState.IDLE)
                     else:
                         yield self._update_state(MediaPlayerState.PAUSED)
                 elif msg.command == MediaPlayerCommand.PLAY:
                     self.music_player.resume()
                     self.announce_player.resume()
-                    if self.music_player.player['idle-active'] and self.announce_player.player['idle-active']:
+                    if self._players_idle():
                         yield self._update_state(MediaPlayerState.IDLE)
                     else:
                         yield self._update_state(MediaPlayerState.PLAYING)
@@ -124,18 +128,20 @@ class MediaPlayerEntity(ESPHomeEntity):
                         self.music_player.set_volume(0)
                         self.announce_player.set_volume(0)
                         self.muted = True
-                    yield self._update_state(self.state)
+                    if self._players_idle():
+                        yield self._update_state(MediaPlayerState.IDLE)
+                    else:
+                        yield self._update_state(self.state)
                 elif msg.command == MediaPlayerCommand.UNMUTE:
                     if self.muted:
                         self.volume = self.previous_volume
                         self.music_player.set_volume(int(self.volume * 100))
                         self.announce_player.set_volume(int(self.volume * 100))
                         self.muted = False
-                    yield self._update_state(self.state)
-                    yield self._update_state(MediaPlayerState.PAUSED)
-                elif msg.command == MediaPlayerCommand.PLAY:
-                    self.music_player.resume()
-                    yield self._update_state(MediaPlayerState.PLAYING)
+                    if self._players_idle():
+                        yield self._update_state(MediaPlayerState.IDLE)
+                    else:
+                        yield self._update_state(self.state)
             elif msg.has_volume:
                 volume = int(msg.volume * 100)
                 self.music_player.set_volume(volume)
@@ -167,6 +173,24 @@ class MediaPlayerEntity(ESPHomeEntity):
             volume=self.volume,
             muted=self.muted,
         )
+
+    def _players_idle(self) -> bool:
+        return self._player_idle(self.music_player) and self._player_idle(
+            self.announce_player
+        )
+
+    @staticmethod
+    def _player_idle(mpv_player: MpvMediaPlayer) -> bool:
+        try:
+            return bool(mpv_player.player["idle-active"])
+        except AttributeError:
+            _LOGGER.debug(
+                "mpv idle-active property unavailable; falling back to local state"
+            )
+            return not mpv_player.is_playing
+        except Exception:  # pragma: no cover - defensive safety net
+            _LOGGER.warning("Unable to determine mpv idle state", exc_info=True)
+            return not mpv_player.is_playing
 
 
 # -----------------------------------------------------------------------------
