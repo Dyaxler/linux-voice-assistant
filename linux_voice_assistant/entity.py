@@ -7,9 +7,12 @@ from typing import Callable, List, Optional, Union
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ListEntitiesMediaPlayerResponse,
     ListEntitiesRequest,
+    ListEntitiesSelectResponse,
     ListEntitiesSwitchResponse,
     MediaPlayerCommandRequest,
     MediaPlayerStateResponse,
+    SelectCommandRequest,
+    SelectStateResponse,
     SubscribeHomeAssistantStatesRequest,
     SwitchCommandRequest,
     SwitchStateResponse,
@@ -247,3 +250,55 @@ class MuteSwitchEntity(ESPHomeEntity):
             # Always return our internal switch state
             self.sync_with_state()
             yield SwitchStateResponse(key=self.key, state=self._switch_state)
+
+
+# -----------------------------------------------------------------------------
+
+
+class WakeWordLibrarySelectEntity(ESPHomeEntity):
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        get_options: Callable[[], List[str]],
+        get_state: Callable[[], str],
+        set_state: Callable[[str], bool],
+    ) -> None:
+        super().__init__(server)
+
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._get_options = get_options
+        self._get_state = get_state
+        self._set_state = set_state
+
+    def update_callbacks(
+        self,
+        get_options: Callable[[], List[str]],
+        get_state: Callable[[], str],
+        set_state: Callable[[str], bool],
+    ) -> None:
+        self._get_options = get_options
+        self._get_state = get_state
+        self._set_state = set_state
+
+    def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
+        if isinstance(msg, SelectCommandRequest) and (msg.key == self.key):
+            new_state = msg.state
+            changed = self._set_state(new_state)
+            yield SelectStateResponse(key=self.key, state=self._get_state())
+            if changed:
+                return
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesSelectResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                options=self._get_options(),
+                entity_category=EntityCategory.CONFIG,
+            )
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            yield SelectStateResponse(key=self.key, state=self._get_state())

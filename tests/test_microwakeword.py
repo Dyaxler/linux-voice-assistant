@@ -8,7 +8,7 @@ from linux_voice_assistant.util import is_arm
 
 _TESTS_DIR = Path(__file__).parent
 _REPO_DIR = _TESTS_DIR.parent
-_MICRO_DIR = _REPO_DIR / "wakewords"
+_MICRO_DIR = _REPO_DIR / "wakewords" / "microWakeWord"
 
 if is_arm():
     _LIB_DIR = _REPO_DIR / "lib" / "linux_arm64"

@@ -5,15 +5,18 @@ import logging
 import re
 import time
 from collections.abc import Iterable
-from typing import Dict, Optional, Set, Union
+from typing import Dict, List, Optional, Union
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     DeviceInfoRequest,
     DeviceInfoResponse,
+    HomeassistantServiceMap,
+    HomeassistantServiceResponse,
     ListEntitiesDoneResponse,
     ListEntitiesRequest,
     MediaPlayerCommandRequest,
+    SelectCommandRequest,
     SubscribeHomeAssistantStatesRequest,
     SwitchCommandRequest,
     VoiceAssistantAnnounceFinished,
@@ -38,11 +41,18 @@ from aioesphomeapi.model import (
 from google.protobuf import message
 
 from .api_server import APIServer
-from .entity import MediaPlayerEntity, MuteSwitchEntity
+from .entity import MediaPlayerEntity, MuteSwitchEntity, WakeWordLibrarySelectEntity
 from .microwakeword import MicroWakeWord
-from .models import ServerState
+from .models import (
+    NO_WAKE_WORD_NAME,
+    NO_WAKE_WORD_SENTINEL,
+    ServerState,
+    make_no_wake_word_id,
+    make_wake_word_unique_id,
+    parse_wake_word_unique_id,
+)
 from .openwakeword import OpenWakeWord
-from .util import call_all
+from .util import call_all, discover_wake_word_libraries
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -57,6 +67,8 @@ class VoiceSatelliteProtocol(APIServer):
         self.state = state
         self.state.satellite = self
         self.state.connected = False
+
+        self._refresh_wake_word_libraries()
 
         existing_media_players = [
             entity
@@ -102,7 +114,7 @@ class VoiceSatelliteProtocol(APIServer):
         if mute_switch is None:
             mute_switch = MuteSwitchEntity(
                 server=self,
-                key=len(state.entities),
+                key=len(self.state.entities),
                 name="Mute",
                 object_id="mute",
                 get_muted=lambda: self.state.muted,
@@ -118,14 +130,67 @@ class VoiceSatelliteProtocol(APIServer):
         mute_switch.update_set_muted(self._set_muted)
         mute_switch.sync_with_state()
 
+        existing_library_selects = [
+            entity
+            for entity in self.state.entities
+            if isinstance(entity, WakeWordLibrarySelectEntity)
+        ]
+        if existing_library_selects:
+            self.state.wake_word_library_entity = existing_library_selects[0]
+            for extra in existing_library_selects[1:]:
+                self.state.entities.remove(extra)
+
+        library_select = self.state.wake_word_library_entity
+        if library_select is None:
+            library_select = WakeWordLibrarySelectEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Wake word lib",
+                object_id="wake_word_library",
+                get_options=self._get_wake_word_library_options,
+                get_state=self._get_wake_word_library_state,
+                set_state=self._set_wake_word_library,
+            )
+            self.state.entities.append(library_select)
+            self.state.wake_word_library_entity = library_select
+        else:
+            library_select.server = self
+            library_select.update_callbacks(
+                self._get_wake_word_library_options,
+                self._get_wake_word_library_state,
+                self._set_wake_word_library,
+            )
+            if library_select not in self.state.entities:
+                self.state.entities.append(library_select)
+
         self._is_streaming_audio = False
         self._tts_url: Optional[str] = None
         self._tts_played = False
         self._continue_conversation = False
         self._timer_finished = False
         self._pipeline_active = False
+        self._current_assistant_index = 0
+        self._pending_assistant_index: Optional[int] = None
 
         self._disconnect_event = asyncio.Event()
+
+    def _assistant_index_for_wake_word(self, wake_word_id: str) -> int:
+        """Return the assistant index associated with a wake word id."""
+
+        selections = (
+            self.state.preferences.assistant.wake_word,
+            self.state.preferences.assistant_2.wake_word,
+        )
+
+        for index, selection in enumerate(selections):
+            if selection.model == NO_WAKE_WORD_NAME:
+                continue
+
+            expected_id = make_wake_word_unique_id(selection.library, selection.model)
+            if expected_id == wake_word_id:
+                return index
+
+        return 0
 
     def _set_muted(self, new_state: bool) -> None:
         self.state.muted = bool(new_state)
@@ -143,6 +208,57 @@ class VoiceSatelliteProtocol(APIServer):
             # Resume normal operation - wake word detection will be active again
             pass
 
+    def _refresh_wake_word_libraries(self) -> None:
+        libraries = discover_wake_word_libraries(self.state.wakewords_dir)
+        if not libraries:
+            return
+
+        self.state.update_wake_word_libraries(libraries)
+
+    def _get_wake_word_library_options(self) -> List[str]:
+        self._refresh_wake_word_libraries()
+        return sorted(self.state.available_wake_word_libraries.keys())
+
+    def _get_wake_word_library_state(self) -> str:
+        return self.state.active_wake_word_library
+
+    def _set_wake_word_library(self, new_library: str) -> bool:
+        if not new_library:
+            return False
+
+        self._refresh_wake_word_libraries()
+        changed = self.state.set_active_wake_word_library(new_library)
+        if changed:
+            _LOGGER.info("Wake word library set: %s", new_library)
+            self.state.save_preferences()
+            self._reload_esphome_config_entry()
+        return changed
+
+    @staticmethod
+    def _slugify_name(value: str) -> str:
+        slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+        return slug or "linux_voice_assistant"
+
+    def _wake_word_library_entity_id(self) -> str:
+        slug = self._slugify_name(self.state.name)
+        return f"select.{slug}_wake_word_lib"
+
+    def _reload_esphome_config_entry(self) -> None:
+        entity_id = self._wake_word_library_entity_id()
+        self.send_messages(
+            [
+                HomeassistantServiceResponse(
+                    service="homeassistant.reload_config_entry",
+                    data=[
+                        HomeassistantServiceMap(
+                            key="entity_id",
+                            value=entity_id,
+                        )
+                    ],
+                )
+            ]
+        )
+
     def handle_voice_event(
         self, event_type: VoiceAssistantEventType, data: Dict[str, str]
     ) -> None:
@@ -153,6 +269,13 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._pipeline_active = True
+
+            assistant_index = self._pending_assistant_index
+            if assistant_index is None:
+                assistant_index = self._current_assistant_index
+
+            self._current_assistant_index = assistant_index
+            self._pending_assistant_index = assistant_index
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
@@ -174,6 +297,7 @@ class VoiceSatelliteProtocol(APIServer):
                 self._tts_finished()
 
             self._tts_played = False
+            self._pending_assistant_index = None
 
         # TODO: handle error
 
@@ -220,7 +344,7 @@ class VoiceSatelliteProtocol(APIServer):
             self.handle_timer_event(VoiceAssistantTimerEventType(msg.event_type), msg)
         elif isinstance(msg, DeviceInfoRequest):
             # Compute dynamic device name
-            base_name = re.sub(r'[\s-]+', '-', self.state.name.lower()).strip('-')
+            base_name = re.sub(r"[\s-]+", "-", self.state.name.lower()).strip("-")
             mac_no_colon = self.state.mac_address.replace(":", "").lower()
             mac_last6 = mac_no_colon[-6:]
             device_name = f"{base_name}-{mac_last6}"
@@ -245,6 +369,7 @@ class VoiceSatelliteProtocol(APIServer):
                 ListEntitiesRequest,
                 SubscribeHomeAssistantStatesRequest,
                 MediaPlayerCommandRequest,
+                SelectCommandRequest,
                 SwitchCommandRequest,
             ),
         ):
@@ -254,52 +379,84 @@ class VoiceSatelliteProtocol(APIServer):
             if isinstance(msg, ListEntitiesRequest):
                 yield ListEntitiesDoneResponse()
         elif isinstance(msg, VoiceAssistantConfigurationRequest):
+            self._refresh_wake_word_libraries()
+            self.state.sync_wake_word_models()
+
+            available_models = self.state.get_active_library_wake_words()
+            library = self.state.active_wake_word_library
+
+            available_wake_words = [
+                VoiceAssistantWakeWord(
+                    id=ww.id,
+                    wake_word=ww.wake_word,
+                    trained_languages=ww.trained_languages,
+                )
+                for ww in available_models.values()
+            ]
+
+            available_wake_words.append(
+                VoiceAssistantWakeWord(
+                    id=make_no_wake_word_id(library),
+                    wake_word=NO_WAKE_WORD_NAME,
+                    trained_languages=[],
+                )
+            )
+
             yield VoiceAssistantConfigurationResponse(
-                available_wake_words=[
-                    VoiceAssistantWakeWord(
-                        id=ww.id,
-                        wake_word=ww.wake_word,
-                        trained_languages=ww.trained_languages,
-                    )
-                    for ww in self.state.available_wake_words.values()
-                ],
-                active_wake_words=[
-                    ww.id for ww in self.state.wake_words.values() if ww.is_active
-                ],
+                available_wake_words=available_wake_words,
+                active_wake_words=self.state.get_active_wake_word_ids(),
                 max_active_wake_words=2,
             )
             _LOGGER.info("Connected to Home Assistant")
         elif isinstance(msg, VoiceAssistantSetConfiguration):
-            # Change active wake words
-            active_wake_words: Set[str] = set()
+            self._refresh_wake_word_libraries()
 
-            for wake_word_id in msg.active_wake_words:
-                if wake_word_id in self.state.wake_words:
-                    # Already active
-                    active_wake_words.add(wake_word_id)
-                    continue
+            requested_ids = list(msg.active_wake_words)
+            library = self.state.active_wake_word_library
+            no_id = make_no_wake_word_id(library)
 
-                model_info = self.state.available_wake_words.get(wake_word_id)
-                if not model_info:
-                    continue
+            while len(requested_ids) < 2:
+                requested_ids.append(no_id)
 
-                _LOGGER.debug("Loading wake word: %s", model_info.config_path)
-                self.state.wake_words[wake_word_id] = model_info.load(
-                    self.state.libtensorflowlite_c_path
+            selections = [
+                self.state.preferences.assistant.wake_word,
+                self.state.preferences.assistant_2.wake_word,
+            ]
+
+            changed = False
+            library_models = self.state.get_active_library_wake_words()
+
+            for index, wake_word_id in enumerate(requested_ids[:2]):
+                selection = selections[index]
+                lib_name, model_id = parse_wake_word_unique_id(
+                    wake_word_id, library
                 )
 
-                _LOGGER.info("Wake word set: %s", wake_word_id)
-                active_wake_words.add(wake_word_id)
-                break
+                if lib_name != library:
+                    continue
 
-            for wake_word in self.state.wake_words.values():
-                wake_word.is_active = wake_word.id in active_wake_words
+                if model_id == NO_WAKE_WORD_SENTINEL or wake_word_id == no_id:
+                    if selection.model != NO_WAKE_WORD_NAME:
+                        selection.model = NO_WAKE_WORD_NAME
+                        changed = True
+                else:
+                    if model_id not in library_models:
+                        _LOGGER.warning("Unrecognized wake word id: %s", wake_word_id)
+                        continue
 
-            _LOGGER.debug("Active wake words: %s", active_wake_words)
+                    if selection.model != model_id:
+                        selection.model = model_id
+                        changed = True
 
-            self.state.preferences.active_wake_words = list(active_wake_words)
-            self.state.save_preferences()
-            self.state.wake_words_changed = True
+                selection.library = library
+
+            self.state.sync_wake_word_models()
+            _LOGGER.debug(
+                "Active wake word ids: %s", self.state.get_active_wake_word_ids()
+            )
+
+            if changed:
+                self.state.save_preferences()
 
     def handle_audio(self, audio_chunk: bytes) -> None:
 
@@ -325,6 +482,13 @@ class VoiceSatelliteProtocol(APIServer):
             return
 
         wake_word_phrase = wake_word.wake_word
+        wake_word_id = getattr(wake_word, "id", None)
+        if isinstance(wake_word_id, str):
+            assistant_index = self._assistant_index_for_wake_word(wake_word_id)
+        else:
+            assistant_index = 0
+
+        self._pending_assistant_index = assistant_index
         _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
@@ -377,6 +541,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._continue_conversation = False
 
         if continue_conversation:
+            self._pending_assistant_index = self._current_assistant_index
             self.send_messages([VoiceAssistantRequest(start=True)])
             self._is_streaming_audio = True
             self._pipeline_active = True

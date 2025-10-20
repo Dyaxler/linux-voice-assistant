@@ -26,9 +26,9 @@ def test_features() -> None:
         libtensorflowlite_c_path=libtensorflowlite_c_path,
     )
     ww = OpenWakeWord(
-        id="ok_nabu",
+        id="okay_nabu",
         wake_word="okay nabu",
-        tflite_model=_OWW_DIR / "ok_nabu_v0.1.tflite",
+        tflite_model=_OWW_DIR / "okay_nabu.tflite",
         libtensorflowlite_c_path=libtensorflowlite_c_path,
     )
 

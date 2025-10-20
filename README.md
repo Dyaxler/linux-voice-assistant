@@ -31,7 +31,7 @@ See `--help` for more options.
 
 ### Microphone
 
-Use `--audio-input-device` to change the microphone device. Use `python3 -m sounddevice` to see the available PortAudio devices. 
+Use `--audio-input-device` to change the microphone device. Use `python3 -m sounddevice` to see the available PortAudio devices.
 
 The microphone device **must** support 16Khz mono audio.
 
@@ -41,7 +41,7 @@ Use `--audio-output-device` to change the speaker device. Use `mpv --audio-devic
 
 ## Wake Word
 
-Change the default wake word with `--wake-model <id>` where `<id>` is the name of a model in the `wakewords` directory. For example, `--wake-model hey_jarvis` will load `wakewords/hey_jarvis.tflite` by default.
+Wake words are automatically discovered from the directories inside `wakewords/`. Each sub-directory represents a wake word library (for example, `wakewords/microWakeWord` or `wakewords/openWakeWord`). Select the active wake word library and assign models to each assistant from Home Assistant, or edit `preferences.json` to set the defaults (including "No Wake Word"). NOTE: At this time, Home Assistant only allows one active wake word library at a time. I.E. you can't use microWakeWord for Assistant and openWakeWord for Assistant 2.
 
 
 ## Connecting to Home Assistant

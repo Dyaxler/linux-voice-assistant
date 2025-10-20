@@ -1,17 +1,14 @@
 """Runs mDNS zeroconf service for Home Assistant discovery."""
 
+import asyncio
 import logging
 import socket
 import uuid
 from typing import Optional
 
-_LOGGER = logging.getLogger(__name__)
+from zeroconf import IPVersion, ServiceInfo, Zeroconf
 
-try:
-    from zeroconf.asyncio import AsyncServiceInfo, AsyncZeroconf
-except ImportError:
-    _LOGGER.fatal("pip install zeroconf")
-    raise
+_LOGGER = logging.getLogger(__name__)
 
 MDNS_TARGET_IP = "224.0.0.251"
 
@@ -32,26 +29,61 @@ class HomeAssistantZeroconf:
 
         assert host
         self.host = host
-        self._aiozc = AsyncZeroconf()
+        self._zeroconf: Optional[Zeroconf] = None
+        self._service_info: Optional[ServiceInfo] = None
+
+    async def _ensure_zeroconf(self) -> Zeroconf:
+        if self._zeroconf is None:
+            self._zeroconf = Zeroconf(ip_version=IPVersion.V4Only)
+        return self._zeroconf
 
     async def register_server(self) -> None:
+        zeroconf = await self._ensure_zeroconf()
 
-        service_info = AsyncServiceInfo(
+        service_info = ServiceInfo(
             "_esphomelib._tcp.local.",
             f"{self.name}._esphomelib._tcp.local.",
             addresses=[socket.inet_aton(self.host)],
             port=self.port,
             properties={
-                "version": "2025.9.0",
-                "mac": _get_mac_address(),
-                "board": "host",
-                "platform": "HOST",
-                "network": "ethernet",  # or "wifi"
+                b"version": b"2025.9.0",
+                b"mac": _get_mac_address().encode("ascii"),
+                b"board": b"host",
+                b"platform": b"HOST",
+                b"network": b"ethernet",  # or b"wifi"
             },
             server=f"{self.name}.local.",
         )
-        await self._aiozc.async_register_service(service_info)
+
+        await asyncio.to_thread(zeroconf.register_service, service_info, allow_name_change=False)
+        self._service_info = service_info
         _LOGGER.debug("Zeroconf discovery enabled: %s", service_info)
+
+    async def unregister_server(self) -> None:
+        if not self._service_info or not self._zeroconf:
+            return
+
+        service_info = self._service_info
+        zeroconf = self._zeroconf
+        self._service_info = None
+
+        try:
+            await asyncio.to_thread(zeroconf.unregister_service, service_info)
+            _LOGGER.debug("Zeroconf discovery disabled: %s", service_info.name)
+        except Exception:
+            _LOGGER.exception("Failed to unregister zeroconf service")
+
+    async def shutdown(self) -> None:
+        await self.unregister_server()
+
+        if self._zeroconf is None:
+            return
+
+        zeroconf = self._zeroconf
+        self._zeroconf = None
+        await asyncio.to_thread(zeroconf.close)
+
+        _LOGGER.debug("Zeroconf closed")
 
 
 def _get_mac_address() -> str:

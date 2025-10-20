@@ -3,21 +3,23 @@ import argparse
 import asyncio
 import json
 import logging
+import signal
 import threading
 import time
+from contextlib import suppress
 from pathlib import Path
 from queue import Queue
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import sounddevice as sd
 
 from .microwakeword import MicroWakeWord, MicroWakeWordFeatures
-from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
+from .models import NO_WAKE_WORD_NAME, Preferences, ServerState, WakeWordType
 from .mpv_player import MpvMediaPlayer
 from .openwakeword import OpenWakeWord, OpenWakeWordFeatures
 from .satellite import VoiceSatelliteProtocol
-from .util import get_mac, is_arm
+from .util import discover_wake_word_libraries, get_mac, is_arm
 from .zeroconf import HomeAssistantZeroconf
 
 _LOGGER = logging.getLogger(__name__)
@@ -47,20 +49,18 @@ async def main() -> None:
     parser.add_argument("--audio-input-block-size", type=int, default=1024)
     parser.add_argument("--audio-output-device", help="mpv name for output device")
     parser.add_argument(
-        "--wake-word-dir",
-        default=[_WAKEWORDS_DIR],
-        action="append",
-        help="Directory with wake word models (.tflite) and configs (.json)",
-    )
-    parser.add_argument(
-        "--wake-model", default="okay_nabu", help="Id of active wake model"
-    )
-    parser.add_argument("--stop-model", default="stop", help="Id of stop model")
-    parser.add_argument(
         "--refractory-seconds",
         default=2.0,
         type=float,
         help="Seconds before wake word can be activated again",
+    )
+    parser.add_argument(
+        "--stop-model",
+        default="stop",
+        help=(
+            "Stop wake word model. Accepts a model id, an optional"
+            " 'library:model' pair, or a direct path to a JSON config."
+        ),
     )
     #
     parser.add_argument(
@@ -99,90 +99,163 @@ async def main() -> None:
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
 
-    # Load available wake words
-    wake_word_dirs = [Path(ww_dir) for ww_dir in args.wake_word_dir]
-    available_wake_words: Dict[str, AvailableWakeWord] = {}
+    wake_word_libraries = discover_wake_word_libraries(_WAKEWORDS_DIR)
+    if not wake_word_libraries:
+        raise RuntimeError(f"No wake word libraries found in {_WAKEWORDS_DIR}")
 
-    for wake_word_dir in wake_word_dirs:
-        for model_config_path in wake_word_dir.glob("*.json"):
-            model_id = model_config_path.stem
-            if model_id == args.stop_model:
-                # Don't show stop model as an available wake word
-                continue
+    _LOGGER.debug(
+        "Discovered wake word libraries: %s", sorted(wake_word_libraries.keys())
+    )
 
-            with open(model_config_path, "r", encoding="utf-8") as model_config_file:
-                model_config = json.load(model_config_file)
-                model_type = model_config["type"]
-                available_wake_words[model_id] = AvailableWakeWord(
-                    id=model_id,
-                    type=WakeWordType(model_type),
-                    wake_word=model_config["wake_word"],
-                    trained_languages=model_config.get("trained_languages", []),
-                    config_path=model_config_path,
-                )
+    library_names = sorted(wake_word_libraries.keys())
+    default_library = (
+        "microWakeWord" if "microWakeWord" in wake_word_libraries else library_names[0]
+    )
 
-    _LOGGER.debug("Available wake words: %s", list(sorted(available_wake_words.keys())))
+    preferred_default_model_ids = ("okay_nabu",)
+
+    def _default_model_for_library(library_name: str) -> str:
+        library_models = wake_word_libraries.get(library_name, {})
+        if not library_models:
+            return NO_WAKE_WORD_NAME
+
+        for model_id in preferred_default_model_ids:
+            if model_id in library_models:
+                return model_id
+
+        return next(iter(sorted(library_models.keys())))
+
+    default_model = _default_model_for_library(default_library)
 
     # Load preferences
     preferences_path = Path(args.preferences_file)
-    if preferences_path.exists():
+    preferences_path_exists = preferences_path.exists()
+    preferences_data = None
+    if preferences_path_exists:
         _LOGGER.debug("Loading preferences: %s", preferences_path)
         with open(preferences_path, "r", encoding="utf-8") as preferences_file:
-            preferences_dict = json.load(preferences_file)
-            preferences = Preferences(**preferences_dict)
-    else:
-        preferences = Preferences()
+            preferences_data = json.load(preferences_file)
+
+    preferences = Preferences.load(
+        preferences_data,
+        default_library=default_library,
+        default_model=default_model,
+        default_second_model=NO_WAKE_WORD_NAME,
+    )
 
     initial_volume = preferences.volume if preferences.volume is not None else 1.0
     initial_volume = max(0.0, min(1.0, float(initial_volume)))
     preferences.volume = initial_volume
 
+    active_library = preferences.assistant.wake_word.library
+    if active_library not in wake_word_libraries:
+        active_library = default_library
+    if not active_library:
+        active_library = default_library
+
+    preferences.assistant.wake_word.library = active_library
+    preferences.assistant_2.wake_word.library = active_library
+
     libtensorflowlite_c_path = _LIB_DIR / "libtensorflowlite_c.so"
     _LOGGER.debug("libtensorflowlite_c path: %s", libtensorflowlite_c_path)
 
-    # Load wake/stop models
-    wake_models: Dict[str, Union[MicroWakeWord, OpenWakeWord]] = {}
-    if preferences.active_wake_words:
-        # Load preferred models
-        for wake_word_id in preferences.active_wake_words:
-            wake_word = available_wake_words.get(wake_word_id)
-            if wake_word is None:
-                _LOGGER.warning("Unrecognized wake word id: %s", wake_word_id)
-                continue
+    stop_argument = str(args.stop_model)
+    stop_config_path: Optional[Path] = None
+    stop_library_name: Optional[str] = None
+    stop_model_id: Optional[str] = None
 
-            _LOGGER.debug("Loading wake model: %s", wake_word_id)
-            wake_models[wake_word_id] = wake_word.load(libtensorflowlite_c_path)
+    stop_path_candidate = Path(stop_argument).expanduser()
+    if stop_path_candidate.suffix:
+        candidate_paths = []
+        if stop_path_candidate.is_absolute():
+            candidate_paths.append(stop_path_candidate)
+        else:
+            candidate_paths.extend(
+                [
+                    _REPO_DIR / stop_path_candidate,
+                    _WAKEWORDS_DIR / stop_path_candidate,
+                    stop_path_candidate,
+                ]
+            )
 
-    if not wake_models:
-        # Load default model
-        wake_word_id = args.wake_model
-        wake_word = available_wake_words[wake_word_id]
+        for candidate_path in candidate_paths:
+            if candidate_path.exists():
+                stop_config_path = candidate_path
+                stop_library_name = candidate_path.parent.name
+                stop_model_id = candidate_path.stem
+                break
+    else:
+        library_hint: Optional[str] = None
+        model_hint = stop_argument.strip()
 
-        _LOGGER.debug("Loading wake model: %s", wake_word_id)
-        wake_models[wake_word_id] = wake_word.load(libtensorflowlite_c_path)
+        if ":" in model_hint:
+            library_part, model_part = model_hint.split(":", 1)
+            library_hint = library_part.strip() or None
+            model_hint = model_part.strip()
 
-    # TODO: allow openWakeWord for "stop"
-    stop_model: Optional[MicroWakeWord] = None
-    for wake_word_dir in wake_word_dirs:
-        stop_config_path = wake_word_dir / f"{args.stop_model}.json"
-        if not stop_config_path.exists():
-            continue
+        if not model_hint:
+            raise RuntimeError("Stop model id cannot be empty")
 
-        _LOGGER.debug("Loading stop model: %s", stop_config_path)
-        stop_model = MicroWakeWord.from_config(
-            stop_config_path, libtensorflowlite_c_path
+        search_directories = []
+        if library_hint:
+            candidate_dir = _WAKEWORDS_DIR / library_hint
+            if not candidate_dir.is_dir():
+                raise RuntimeError(
+                    f"Stop wake word library '{library_hint}' not found in {_WAKEWORDS_DIR}"
+                )
+            search_directories.append(candidate_dir)
+        else:
+            search_directories = [
+                library_dir
+                for library_dir in sorted(_WAKEWORDS_DIR.iterdir())
+                if library_dir.is_dir()
+            ]
+
+        for library_dir in search_directories:
+            candidate_path = library_dir / f"{model_hint}.json"
+            if candidate_path.exists():
+                stop_config_path = candidate_path
+                stop_library_name = library_dir.name
+                stop_model_id = model_hint
+                break
+
+    if stop_config_path is None:
+        raise RuntimeError(
+            f"Unable to locate stop wake word config for argument '{stop_argument}'"
         )
-        break
 
-    assert stop_model is not None
+    try:
+        with open(stop_config_path, "r", encoding="utf-8") as stop_config_file:
+            stop_config = json.load(stop_config_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Failed to load stop wake word config: {stop_config_path}") from exc
+
+    stop_type = stop_config.get("type")
+    if stop_type != WakeWordType.MICRO_WAKE_WORD.value:
+        raise RuntimeError(
+            "Stop wake word must be a microWakeWord model. "
+            f"Config {stop_config_path} reports type '{stop_type}'."
+        )
+
+    _LOGGER.debug(
+        "Loading stop model: %s (library=%s, model_id=%s)",
+        stop_config_path,
+        stop_library_name,
+        stop_model_id,
+    )
+    stop_model = MicroWakeWord.from_config(
+        stop_config_path, libtensorflowlite_c_path
+    )
 
     state = ServerState(
         name=args.name,
         mac_address=get_mac(),
         audio_queue=Queue(),
         entities=[],
-        available_wake_words=available_wake_words,
-        wake_words=wake_models,
+        wakewords_dir=_WAKEWORDS_DIR,
+        available_wake_word_libraries=wake_word_libraries,
+        active_wake_word_library=active_library,
+        wake_words={},
         stop_word=stop_model,
         music_player=MpvMediaPlayer(device=args.audio_output_device),
         tts_player=MpvMediaPlayer(device=args.audio_output_device),
@@ -195,7 +268,13 @@ async def main() -> None:
         oww_embedding_path=Path(args.oww_embedding_model),
         refractory_seconds=args.refractory_seconds,
         volume=initial_volume,
+        preferred_default_model_ids=preferred_default_model_ids,
     )
+
+    if not preferences_path_exists:
+        state.save_preferences()
+
+    state.sync_wake_word_models()
 
     initial_volume_percent = int(round(initial_volume * 100))
     state.music_player.set_volume(initial_volume_percent)
@@ -210,32 +289,67 @@ async def main() -> None:
         state.audio_queue.put_nowait(bytes(indata))
 
     loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    registered_signals: List[int] = []
+
+    def _request_shutdown(signame: str) -> None:
+        _LOGGER.info("Received %s, shutting down", signame)
+        stop_event.set()
+
+    for signame in ("SIGINT", "SIGTERM"):
+        if hasattr(signal, signame):
+            sig = getattr(signal, signame)
+            try:
+                loop.add_signal_handler(
+                    sig,
+                    lambda signame=signame: _request_shutdown(signame),
+                )
+            except NotImplementedError:
+                _LOGGER.debug("Signal handlers not supported for %s", signame)
+            else:
+                registered_signals.append(sig)
+
     server = await loop.create_server(
         lambda: VoiceSatelliteProtocol(state), host=args.host, port=args.port
     )
 
     # Auto discovery (zeroconf, mDNS)
     discovery = HomeAssistantZeroconf(port=args.port, name=args.name)
-    await discovery.register_server()
 
     try:
-        _LOGGER.debug("Opening audio input device: %s", args.audio_input_device)
-        with sd.RawInputStream(
-            samplerate=16000,
-            blocksize=args.audio_input_block_size,
-            device=args.audio_input_device,
-            dtype="int16",
-            channels=1,
-            callback=sd_callback,
-        ):
-            async with server:
-                _LOGGER.info("Server started (host=%s, port=%s)", args.host, args.port)
-                await server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        await discovery.register_server()
+
+        try:
+            _LOGGER.debug("Opening audio input device: %s", args.audio_input_device)
+            with sd.RawInputStream(
+                samplerate=16000,
+                blocksize=args.audio_input_block_size,
+                device=args.audio_input_device,
+                dtype="int16",
+                channels=1,
+                callback=sd_callback,
+            ):
+                async with server:
+                    _LOGGER.info(
+                        "Server started (host=%s, port=%s)", args.host, args.port
+                    )
+                    server_task = asyncio.create_task(server.serve_forever())
+                    server_task.add_done_callback(lambda _fut: stop_event.set())
+                    try:
+                        await stop_event.wait()
+                    finally:
+                        server_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await server_task
+        except KeyboardInterrupt:
+            _request_shutdown("KeyboardInterrupt")
     finally:
+        stop_event.set()
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
+        for sig in registered_signals:
+            loop.remove_signal_handler(sig)
+        await discovery.shutdown()
 
     _LOGGER.debug("Server stopped")
 
