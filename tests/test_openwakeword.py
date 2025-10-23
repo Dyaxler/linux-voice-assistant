@@ -1,7 +1,11 @@
 """Tests for openWakeWord."""
 
+import os
 import wave
+import ctypes
 from pathlib import Path
+
+import pytest
 
 from linux_voice_assistant.openwakeword import OpenWakeWordFeatures, OpenWakeWord
 from linux_voice_assistant.util import is_arm
@@ -15,10 +19,29 @@ if is_arm():
 else:
     _LIB_DIR = _REPO_DIR / "lib" / "linux_amd64"
 
-
 libtensorflowlite_c_path = _LIB_DIR / "libtensorflowlite_c.so"
 
 
+def _can_load_tflite(lib_path: Path) -> bool:
+    """
+    Try to load the bundled libtensorflowlite_c.so via ctypes, and
+    add its directory to LD_LIBRARY_PATH just in case.
+    """
+    try:
+        os.environ["LD_LIBRARY_PATH"] = f"{lib_path.parent}:{os.environ.get('LD_LIBRARY_PATH','')}"
+        ctypes.CDLL(str(lib_path), mode=ctypes.RTLD_LOCAL)
+        return True
+    except Exception:
+        return False
+
+
+skip_if_no_tflite = pytest.mark.skipif(
+    os.environ.get("OPENWAKEWORD_DISABLE_TESTS") == "1" or not _can_load_tflite(libtensorflowlite_c_path),
+    reason="TFLite C library not loadable on this runner (missing deps or wrong arch) or tests disabled."
+)
+
+
+@skip_if_no_tflite
 def test_features() -> None:
     features = OpenWakeWordFeatures(
         melspectrogram_model=_OWW_DIR / "melspectrogram.tflite",
