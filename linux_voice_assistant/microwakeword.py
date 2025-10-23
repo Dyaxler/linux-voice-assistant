@@ -1,5 +1,6 @@
 import ctypes
 import json
+import logging
 import statistics
 from collections import deque
 from collections.abc import Iterable
@@ -10,6 +11,9 @@ import numpy as np
 from pymicro_features import MicroFrontend
 
 from .wakeword import TfLiteWakeWord
+
+
+LOGGER = logging.getLogger(__name__)
 
 SAMPLES_PER_SECOND = 16000
 SAMPLES_PER_CHUNK = 160  # 10ms
@@ -35,7 +39,7 @@ class MicroWakeWord(TfLiteWakeWord):
         self.id = id
         self.wake_word = wake_word
         self.tflite_model = tflite_model
-        self.probability_cutoff = probability_cutoff
+        self._probability_cutoff = float(probability_cutoff)
         self.sliding_window_size = sliding_window_size
         self.trained_languages = trained_languages
 
@@ -105,10 +109,26 @@ class MicroWakeWord(TfLiteWakeWord):
             return False
 
         # Allocate and quantize input data
-        quant_features = np.round(
-            np.concatenate(self._features, axis=1) / self.input_scale
-            + self.input_zero_point
-        ).astype(np.uint8)
+        feature_window = np.concatenate(self._features, axis=1).astype(np.float32)
+        feature_window = np.nan_to_num(
+            feature_window, nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        input_scale = self.input_scale
+        if not np.isfinite(input_scale) or input_scale <= 0:
+            LOGGER.warning("Invalid input scale %s; defaulting to 1.0", input_scale)
+            input_scale = 1.0
+
+        input_zero_point = self.input_zero_point
+        if not np.isfinite(input_zero_point):
+            LOGGER.warning(
+                "Invalid input zero point %s; defaulting to 0", input_zero_point
+            )
+            input_zero_point = 0.0
+
+        quant_features = np.round(feature_window / input_scale + input_zero_point)
+        np.clip(quant_features, 0, np.iinfo(np.uint8).max, out=quant_features)
+        quant_features = quant_features.astype(np.uint8)
 
         # Stride instead of rolling
         self._features.clear()
@@ -142,10 +162,20 @@ class MicroWakeWord(TfLiteWakeWord):
             # Not enough probabilities
             return False
 
-        if statistics.mean(self._probabilities) > self.probability_cutoff:
+        if statistics.mean(self._probabilities) > self._probability_cutoff:
             return True
 
         return False
+
+    def set_probability_cutoff(self, probability_cutoff: float) -> None:
+        """Update the probability cutoff used for activation."""
+
+        self._probability_cutoff = max(0.0, min(1.0, float(probability_cutoff)))
+
+    def get_probability_cutoff(self) -> float:
+        """Return the current probability cutoff."""
+
+        return self._probability_cutoff
 
 
 # -----------------------------------------------------------------------------

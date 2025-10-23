@@ -269,6 +269,10 @@ async def main() -> None:
         refractory_seconds=args.refractory_seconds,
         volume=initial_volume,
         preferred_default_model_ids=preferred_default_model_ids,
+        wake_word_sensitivity=preferences.wake_word_sensitivity,
+        wake_word_probability_cutoff=preferences.wake_word_probability,
+        wake_sound_enabled=preferences.wake_sound_enabled,
+        timer_sound_enabled=preferences.timer_sound_enabled,
     )
 
     if not preferences_path_exists:
@@ -419,11 +423,15 @@ def process_audio(state: ServerState):
                         for micro_input in micro_inputs:
                             if wake_word.process_streaming(micro_input):
                                 activated = True
+                                break
                     elif isinstance(wake_word, OpenWakeWord):
                         for oww_input in oww_inputs:
                             for prob in wake_word.process_streaming(oww_input):
-                                if prob > 0.5:
+                                if wake_word.should_activate(prob):
                                     activated = True
+                                    break
+                            if activated:
+                                break
 
                     if activated and not state.muted:
                         # Check refractory

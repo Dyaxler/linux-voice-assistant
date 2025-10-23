@@ -13,6 +13,8 @@ if TYPE_CHECKING:
         ESPHomeEntity,
         MediaPlayerEntity,
         MuteSwitchEntity,
+        ConfigButtonEntity,
+        ConfigSwitchEntity,
         WakeWordLibrarySelectEntity,
     )
     from .microwakeword import MicroWakeWord
@@ -24,6 +26,38 @@ _LOGGER = logging.getLogger(__name__)
 
 NO_WAKE_WORD_NAME = "No Wake Word"
 NO_WAKE_WORD_SENTINEL = "__no_wake_word__"
+
+WAKE_WORD_SENSITIVITY_LABELS: Tuple[str, ...] = (
+    "Slightly sensitive",
+    "Moderately sensitive",
+    "Very sensitive",
+)
+
+WAKE_WORD_SENSITIVITY_TO_CUTOFF: Dict[str, float] = {
+    "Slightly sensitive": 0.9,
+    "Moderately sensitive": 0.7,
+    "Very sensitive": 0.5,
+}
+
+DEFAULT_WAKE_WORD_SENSITIVITY = "Moderately sensitive"
+DEFAULT_WAKE_WORD_PROBABILITY = WAKE_WORD_SENSITIVITY_TO_CUTOFF[
+    DEFAULT_WAKE_WORD_SENSITIVITY
+]
+
+
+def get_wake_word_cutoff_for_label(label: str) -> float:
+    return WAKE_WORD_SENSITIVITY_TO_CUTOFF.get(label, DEFAULT_WAKE_WORD_PROBABILITY)
+
+
+def label_for_wake_word_cutoff(cutoff: float) -> str:
+    closest_label = DEFAULT_WAKE_WORD_SENSITIVITY
+    smallest_difference = float("inf")
+    for label, value in WAKE_WORD_SENSITIVITY_TO_CUTOFF.items():
+        difference = abs(value - cutoff)
+        if difference < smallest_difference:
+            smallest_difference = difference
+            closest_label = label
+    return closest_label
 
 
 class WakeWordType(str, Enum):
@@ -137,6 +171,10 @@ class Preferences:
     assistant: AssistantPreferences = field(default_factory=AssistantPreferences)
     assistant_2: AssistantPreferences = field(default_factory=AssistantPreferences)
     microphone_mute: bool = False
+    wake_word_sensitivity: str = DEFAULT_WAKE_WORD_SENSITIVITY
+    wake_word_probability: float = DEFAULT_WAKE_WORD_PROBABILITY
+    wake_sound_enabled: bool = True
+    timer_sound_enabled: bool = True
 
     @classmethod
     def load(
@@ -157,8 +195,42 @@ class Preferences:
                     preferences.volume = None
 
             preferences.microphone_mute = bool(data.get("microphone_mute", False))
+            preferences.wake_sound_enabled = bool(
+                data.get("wake_sound_enabled", True)
+            )
+            preferences.timer_sound_enabled = bool(
+                data.get("timer_sound_enabled", True)
+            )
         else:
             preferences.microphone_mute = False
+            preferences.wake_sound_enabled = True
+            preferences.timer_sound_enabled = True
+
+        sensitivity_label = DEFAULT_WAKE_WORD_SENSITIVITY
+        probability_value: Optional[float] = None
+
+        if isinstance(data, dict):
+            stored_label = data.get("wake_word_sensitivity")
+            if (
+                isinstance(stored_label, str)
+                and stored_label in WAKE_WORD_SENSITIVITY_TO_CUTOFF
+            ):
+                sensitivity_label = stored_label
+            else:
+                stored_probability = data.get("wake_word_probability")
+                if stored_probability is not None:
+                    try:
+                        probability_value = float(stored_probability)
+                    except (TypeError, ValueError):
+                        probability_value = None
+
+        if probability_value is not None:
+            sensitivity_label = label_for_wake_word_cutoff(probability_value)
+
+        preferences.wake_word_sensitivity = sensitivity_label
+        preferences.wake_word_probability = get_wake_word_cutoff_for_label(
+            sensitivity_label
+        )
 
         preferences.assistant = AssistantPreferences.from_dict(
             data.get("assistant") if isinstance(data, dict) else None,
@@ -224,6 +296,15 @@ class ServerState:
     connected: bool = False
     volume: float = 1.0
     preferred_default_model_ids: Tuple[str, ...] = ("okay_nabu",)
+    wake_word_sensitivity: str = DEFAULT_WAKE_WORD_SENSITIVITY
+    wake_word_probability_cutoff: float = DEFAULT_WAKE_WORD_PROBABILITY
+    wake_sound_enabled: bool = True
+    timer_sound_enabled: bool = True
+    wake_word_sensitivity_entity: "Optional[WakeWordLibrarySelectEntity]" = None
+    wake_sound_switch_entity: "Optional[ConfigSwitchEntity]" = None
+    timer_sound_switch_entity: "Optional[ConfigSwitchEntity]" = None
+    reset_assistant_button_entity: "Optional[ConfigButtonEntity]" = None
+    restart_device_button_entity: "Optional[ConfigButtonEntity]" = None
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""
@@ -338,6 +419,8 @@ class ServerState:
             previous_ids != new_ids or previous_active != new_active
         )
 
+        self.apply_wake_word_sensitivity()
+
     def get_active_wake_word_ids(self) -> List[str]:
         library_models = self.get_active_library_wake_words()
         no_id = make_no_wake_word_id(self.active_wake_word_library)
@@ -388,3 +471,51 @@ class ServerState:
 
         self.ensure_preferences_valid()
         self.sync_wake_word_models()
+
+    def apply_wake_word_sensitivity(self) -> None:
+        cutoff = get_wake_word_cutoff_for_label(self.wake_word_sensitivity)
+        self.wake_word_probability_cutoff = cutoff
+        self.preferences.wake_word_probability = cutoff
+        for wake_word in self.wake_words.values():
+            if hasattr(wake_word, "set_probability_cutoff"):
+                wake_word.set_probability_cutoff(cutoff)
+
+    def set_wake_word_sensitivity(self, label: str) -> bool:
+        if label not in WAKE_WORD_SENSITIVITY_TO_CUTOFF:
+            _LOGGER.warning("Unknown wake word sensitivity: %s", label)
+            return False
+
+        if self.wake_word_sensitivity == label:
+            return False
+
+        self.wake_word_sensitivity = label
+        self.preferences.wake_word_sensitivity = label
+        self.apply_wake_word_sensitivity()
+        self.save_preferences()
+        return True
+
+    def set_wake_sound_enabled(self, enabled: bool) -> bool:
+        enabled = bool(enabled)
+        if (
+            self.wake_sound_enabled == enabled
+            and self.preferences.wake_sound_enabled == enabled
+        ):
+            return False
+
+        self.wake_sound_enabled = enabled
+        self.preferences.wake_sound_enabled = enabled
+        self.save_preferences()
+        return True
+
+    def set_timer_sound_enabled(self, enabled: bool) -> bool:
+        enabled = bool(enabled)
+        if (
+            self.timer_sound_enabled == enabled
+            and self.preferences.timer_sound_enabled == enabled
+        ):
+            return False
+
+        self.timer_sound_enabled = enabled
+        self.preferences.timer_sound_enabled = enabled
+        self.save_preferences()
+        return True

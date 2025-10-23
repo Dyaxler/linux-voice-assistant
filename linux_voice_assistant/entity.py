@@ -5,8 +5,10 @@ from typing import Callable, List, Optional, Union
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
+    ButtonCommandRequest,
     ListEntitiesMediaPlayerResponse,
     ListEntitiesRequest,
+    ListEntitiesButtonResponse,
     ListEntitiesSelectResponse,
     ListEntitiesSwitchResponse,
     MediaPlayerCommandRequest,
@@ -256,6 +258,67 @@ class MuteSwitchEntity(ESPHomeEntity):
 # -----------------------------------------------------------------------------
 
 
+class ConfigSwitchEntity(ESPHomeEntity):
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        icon: str,
+        get_state: Callable[[], bool],
+        set_state: Callable[[bool], None],
+    ) -> None:
+        super().__init__(server)
+
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._icon = icon
+        self._get_state = get_state
+        self._set_state = set_state
+        self._switch_state = bool(self._get_state())
+
+    def update_callbacks(
+        self,
+        get_state: Callable[[], bool],
+        set_state: Callable[[bool], None],
+    ) -> None:
+        self._get_state = get_state
+        self._set_state = set_state
+
+    def sync_with_state(self) -> None:
+        self._switch_state = bool(self._get_state())
+
+    def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
+        if isinstance(msg, SwitchCommandRequest) and (msg.key == self.key):
+            new_state = bool(msg.state)
+            try:
+                self._set_state(new_state)
+            except Exception:  # pragma: no cover - defensive safety net
+                _LOGGER.exception(
+                    "Failed to update switch '%s' to state %s",
+                    self.object_id,
+                    new_state,
+                )
+            self.sync_with_state()
+            yield SwitchStateResponse(key=self.key, state=self._switch_state)
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesSwitchResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                entity_category=EntityCategory.CONFIG,
+                icon=self._icon,
+            )
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            self.sync_with_state()
+            yield SwitchStateResponse(key=self.key, state=self._switch_state)
+
+
+# -----------------------------------------------------------------------------
+
+
 class WakeWordLibrarySelectEntity(ESPHomeEntity):
     def __init__(
         self,
@@ -303,3 +366,43 @@ class WakeWordLibrarySelectEntity(ESPHomeEntity):
             )
         elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
             yield SelectStateResponse(key=self.key, state=self._get_state())
+
+
+# -----------------------------------------------------------------------------
+
+
+class ConfigButtonEntity(ESPHomeEntity):
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        icon: str,
+        press_callback: Callable[[], None],
+    ) -> None:
+        super().__init__(server)
+
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._icon = icon
+        self._press_callback = press_callback
+
+    def update_callback(self, press_callback: Callable[[], None]) -> None:
+        self._press_callback = press_callback
+
+    def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
+        if isinstance(msg, ButtonCommandRequest) and (msg.key == self.key):
+            try:
+                self._press_callback()
+            except Exception:  # pragma: no cover - defensive safety net
+                _LOGGER.exception("Failed to execute button '%s'", self.object_id)
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesButtonResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                entity_category=EntityCategory.CONFIG,
+                icon=self._icon,
+            )

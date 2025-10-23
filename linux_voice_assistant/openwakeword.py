@@ -56,12 +56,14 @@ class OpenWakeWord(TfLiteWakeWord):
         wake_word: str,
         tflite_model: Union[str, Path],
         libtensorflowlite_c_path: Union[str, Path],
+        probability_cutoff: float = 0.5,
     ):
         TfLiteWakeWord.__init__(self, libtensorflowlite_c_path)
 
         self.id = id
         self.wake_word = wake_word
         self.tflite_model = tflite_model
+        self._probability_cutoff = max(0.0, min(1.0, float(probability_cutoff)))
 
         self.is_active = True
 
@@ -138,6 +140,21 @@ class OpenWakeWord(TfLiteWakeWord):
 
             yield probs.item()
 
+    def set_probability_cutoff(self, probability_cutoff: float) -> None:
+        """Update the probability threshold used for detections."""
+
+        self._probability_cutoff = max(0.0, min(1.0, float(probability_cutoff)))
+
+    def get_probability_cutoff(self) -> float:
+        """Return the current detection probability threshold."""
+
+        return self._probability_cutoff
+
+    def should_activate(self, probability: float) -> bool:
+        """Return True if the provided probability triggers detection."""
+
+        return probability >= self._probability_cutoff
+
     @staticmethod
     def from_config(
         config_path: Union[str, Path],
@@ -147,11 +164,14 @@ class OpenWakeWord(TfLiteWakeWord):
         with open(config_path, "r", encoding="utf-8") as config_file:
             config = json.load(config_file)
 
+        probability_cutoff = float(config.get("probability_cutoff", 0.5))
+
         return OpenWakeWord(
             id=Path(config["model"]).stem,
             wake_word=config["wake_word"],
             tflite_model=config_path.parent / config["model"],
             libtensorflowlite_c_path=libtensorflowlite_c_path,
+            probability_cutoff=probability_cutoff,
         )
 
 

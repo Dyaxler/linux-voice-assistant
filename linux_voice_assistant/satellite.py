@@ -2,13 +2,17 @@
 
 import asyncio
 import logging
+import signal
 import re
+import subprocess
+import threading
 import time
 from collections.abc import Iterable
 from typing import Dict, List, Optional, Union
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
+    ButtonCommandRequest,
     DeviceInfoRequest,
     DeviceInfoResponse,
     HomeassistantServiceMap,
@@ -41,7 +45,13 @@ from aioesphomeapi.model import (
 from google.protobuf import message
 
 from .api_server import APIServer
-from .entity import MediaPlayerEntity, MuteSwitchEntity, WakeWordLibrarySelectEntity
+from .entity import (
+    ConfigButtonEntity,
+    ConfigSwitchEntity,
+    MediaPlayerEntity,
+    MuteSwitchEntity,
+    WakeWordLibrarySelectEntity,
+)
 from .microwakeword import MicroWakeWord
 from .models import (
     NO_WAKE_WORD_NAME,
@@ -50,6 +60,7 @@ from .models import (
     make_no_wake_word_id,
     make_wake_word_unique_id,
     parse_wake_word_unique_id,
+    WAKE_WORD_SENSITIVITY_LABELS,
 )
 from .openwakeword import OpenWakeWord
 from .util import call_all, discover_wake_word_libraries
@@ -64,8 +75,18 @@ class VoiceSatelliteProtocol(APIServer):
     def __init__(self, state: ServerState) -> None:
         super().__init__(state.name)
 
+        self._is_streaming_audio = False
+        self._audio_stream_open = False
+        self._tts_url: Optional[str] = None
+        self._tts_played = False
+        self._continue_conversation = False
+        self._timer_finished = False
+        self._pipeline_active = False
+        self._current_assistant_index = 0
+        self._pending_assistant_index: Optional[int] = None
+        self._disconnect_event = asyncio.Event()
+
         self.state = state
-        self.state.satellite = self
         self.state.connected = False
 
         self._refresh_wake_word_libraries()
@@ -163,16 +184,112 @@ class VoiceSatelliteProtocol(APIServer):
             if library_select not in self.state.entities:
                 self.state.entities.append(library_select)
 
-        self._is_streaming_audio = False
-        self._tts_url: Optional[str] = None
-        self._tts_played = False
-        self._continue_conversation = False
-        self._timer_finished = False
-        self._pipeline_active = False
-        self._current_assistant_index = 0
-        self._pending_assistant_index: Optional[int] = None
+        sensitivity_select = self.state.wake_word_sensitivity_entity
+        if sensitivity_select is None:
+            sensitivity_select = WakeWordLibrarySelectEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Wake word sensitivity",
+                object_id="wake_word_sensitivity",
+                get_options=self._get_wake_word_sensitivity_options,
+                get_state=self._get_wake_word_sensitivity_state,
+                set_state=self._set_wake_word_sensitivity,
+            )
+            self.state.entities.append(sensitivity_select)
+            self.state.wake_word_sensitivity_entity = sensitivity_select
+        else:
+            sensitivity_select.server = self
+            sensitivity_select.update_callbacks(
+                self._get_wake_word_sensitivity_options,
+                self._get_wake_word_sensitivity_state,
+                self._set_wake_word_sensitivity,
+            )
+            if sensitivity_select not in self.state.entities:
+                self.state.entities.append(sensitivity_select)
 
-        self._disconnect_event = asyncio.Event()
+        wake_sound_switch = self.state.wake_sound_switch_entity
+        if wake_sound_switch is None:
+            wake_sound_switch = ConfigSwitchEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Wake sound",
+                object_id="wake_sound",
+                icon="mdi:bullhorn",
+                get_state=self._get_wake_sound_enabled,
+                set_state=self._set_wake_sound_enabled,
+            )
+            self.state.entities.append(wake_sound_switch)
+            self.state.wake_sound_switch_entity = wake_sound_switch
+        else:
+            wake_sound_switch.server = self
+            wake_sound_switch.update_callbacks(
+                self._get_wake_sound_enabled,
+                self._set_wake_sound_enabled,
+            )
+            if wake_sound_switch not in self.state.entities:
+                self.state.entities.append(wake_sound_switch)
+        wake_sound_switch.sync_with_state()
+
+        timer_sound_switch = self.state.timer_sound_switch_entity
+        if timer_sound_switch is None:
+            timer_sound_switch = ConfigSwitchEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Timer finished",
+                object_id="timer_finished_sound",
+                icon="mdi:timer",
+                get_state=self._get_timer_sound_enabled,
+                set_state=self._set_timer_sound_enabled,
+            )
+            self.state.entities.append(timer_sound_switch)
+            self.state.timer_sound_switch_entity = timer_sound_switch
+        else:
+            timer_sound_switch.server = self
+            timer_sound_switch.update_callbacks(
+                self._get_timer_sound_enabled,
+                self._set_timer_sound_enabled,
+            )
+            if timer_sound_switch not in self.state.entities:
+                self.state.entities.append(timer_sound_switch)
+        timer_sound_switch.sync_with_state()
+
+        reset_button = self.state.reset_assistant_button_entity
+        if reset_button is None:
+            reset_button = ConfigButtonEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Reset assistant",
+                object_id="reset_assistant",
+                icon="mdi:restart",
+                press_callback=self._reset_assistant,
+            )
+            self.state.entities.append(reset_button)
+            self.state.reset_assistant_button_entity = reset_button
+        else:
+            reset_button.server = self
+            reset_button.update_callback(self._reset_assistant)
+            if reset_button not in self.state.entities:
+                self.state.entities.append(reset_button)
+
+        restart_button = self.state.restart_device_button_entity
+        if restart_button is None:
+            restart_button = ConfigButtonEntity(
+                server=self,
+                key=len(self.state.entities),
+                name="Restart device",
+                object_id="restart_device",
+                icon="mdi:power",
+                press_callback=self._restart_device,
+            )
+            self.state.entities.append(restart_button)
+            self.state.restart_device_button_entity = restart_button
+        else:
+            restart_button.server = self
+            restart_button.update_callback(self._restart_device)
+            if restart_button not in self.state.entities:
+                self.state.entities.append(restart_button)
+
+        self.state.satellite = self
 
     def _assistant_index_for_wake_word(self, wake_word_id: str) -> int:
         """Return the assistant index associated with a wake word id."""
@@ -198,7 +315,7 @@ class VoiceSatelliteProtocol(APIServer):
         if self.state.muted:
             # voice_assistant.stop behavior
             _LOGGER.debug("Muting voice assistant (voice_assistant.stop)")
-            self._is_streaming_audio = False
+            self._stop_audio_stream()
             self.state.tts_player.stop()
             # Stop any ongoing voice processing
             self.state.stop_word.is_active = False
@@ -239,6 +356,93 @@ class VoiceSatelliteProtocol(APIServer):
         slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
         return slug or "linux_voice_assistant"
 
+    def _get_wake_word_sensitivity_options(self) -> List[str]:
+        return list(WAKE_WORD_SENSITIVITY_LABELS)
+
+    def _get_wake_word_sensitivity_state(self) -> str:
+        return self.state.wake_word_sensitivity
+
+    def _set_wake_word_sensitivity(self, new_label: str) -> bool:
+        changed = self.state.set_wake_word_sensitivity(new_label)
+        if changed:
+            _LOGGER.info("Wake word sensitivity set: %s", new_label)
+        return changed
+
+    def _get_wake_sound_enabled(self) -> bool:
+        return self.state.wake_sound_enabled
+
+    def _set_wake_sound_enabled(self, enabled: bool) -> None:
+        changed = self.state.set_wake_sound_enabled(enabled)
+        if changed:
+            _LOGGER.info(
+                "Wake sound %s",
+                "enabled" if enabled else "disabled",
+            )
+
+    def _get_timer_sound_enabled(self) -> bool:
+        return self.state.timer_sound_enabled
+
+    def _set_timer_sound_enabled(self, enabled: bool) -> None:
+        changed = self.state.set_timer_sound_enabled(enabled)
+        if changed:
+            _LOGGER.info(
+                "Timer finished sound %s",
+                "enabled" if enabled else "disabled",
+            )
+            if not enabled and self._timer_finished:
+                self._timer_finished = False
+                self.state.tts_player.stop()
+                self.unduck()
+
+    def _reset_assistant(self) -> None:
+        self._run_background_command(
+            [
+                "/usr/bin/systemctl",
+                "--user",
+                "restart",
+                "linux-voice-assistant.service",
+            ],
+            "Restarting linux-voice-assistant service",
+        )
+
+    def _restart_device(self) -> None:
+        self._run_background_command(
+            ["sudo", "/usr/bin/systemctl", "reboot"],
+            "Rebooting device",
+        )
+
+    def _run_background_command(self, command: List[str], log_message: str) -> None:
+        def _execute() -> None:
+            _LOGGER.info(log_message)
+            try:
+                completed = subprocess.run(command, check=False)
+            except FileNotFoundError:
+                _LOGGER.exception("Command not found: %s", command[0])
+            except Exception:  # pragma: no cover - defensive safety net
+                _LOGGER.exception("Unexpected error running command: %s", command)
+            else:
+                returncode = completed.returncode
+                if returncode < 0:
+                    signal_number = -returncode
+                    try:
+                        signal_name = signal.Signals(signal_number).name
+                    except ValueError:
+                        signal_name = str(signal_number)
+                    _LOGGER.debug(
+                        "Command terminated by signal %s (%s): %s",
+                        signal_number,
+                        signal_name,
+                        command,
+                    )
+                elif returncode > 0:
+                    _LOGGER.error(
+                        "Command exited with code %s: %s",
+                        returncode,
+                        command,
+                    )
+
+        threading.Thread(target=_execute, daemon=True).start()
+
     def _wake_word_library_entity_id(self) -> str:
         slug = self._slugify_name(self.state.name)
         return f"select.{slug}_wake_word_lib"
@@ -269,6 +473,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_played = False
             self._continue_conversation = False
             self._pipeline_active = True
+            self._start_audio_stream()
 
             assistant_index = self._pending_assistant_index
             if assistant_index is None:
@@ -276,11 +481,13 @@ class VoiceSatelliteProtocol(APIServer):
 
             self._current_assistant_index = assistant_index
             self._pending_assistant_index = assistant_index
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
+            self._start_audio_stream()
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
-            self._is_streaming_audio = False
+            self._stop_audio_stream()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
             if data.get("tts_start_streaming") == "1":
                 # Start streaming early
@@ -292,7 +499,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_url = data.get("url")
             self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
-            self._is_streaming_audio = False
+            self._stop_audio_stream()
             if not self._tts_played:
                 self._tts_finished()
 
@@ -371,6 +578,7 @@ class VoiceSatelliteProtocol(APIServer):
                 MediaPlayerCommandRequest,
                 SelectCommandRequest,
                 SwitchCommandRequest,
+                ButtonCommandRequest,
             ),
         ):
             for entity in self.state.entities:
@@ -465,6 +673,17 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.send_messages([VoiceAssistantAudio(data=audio_chunk)])
 
+    def _start_audio_stream(self) -> None:
+        self._is_streaming_audio = True
+        if not self._audio_stream_open:
+            self._audio_stream_open = True
+
+    def _stop_audio_stream(self) -> None:
+        if self._audio_stream_open:
+            self.send_messages([VoiceAssistantAudio(end=True)])
+            self._audio_stream_open = False
+        self._is_streaming_audio = False
+
     def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord]) -> None:
         if self._timer_finished:
             # Stop timer instead
@@ -494,11 +713,13 @@ class VoiceSatelliteProtocol(APIServer):
             [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
         )
         self.duck()
-        self._is_streaming_audio = True
+        self._start_audio_stream()
         self._pipeline_active = True
-        self.state.tts_player.play(self.state.wakeup_sound)
+        if self.state.wake_sound_enabled and self.state.wakeup_sound:
+            self.state.tts_player.play(self.state.wakeup_sound)
 
     def stop(self) -> None:
+        self._stop_audio_stream()
         self.state.stop_word.is_active = False
         self.state.tts_player.stop()
         self._continue_conversation = False
@@ -543,7 +764,7 @@ class VoiceSatelliteProtocol(APIServer):
         if continue_conversation:
             self._pending_assistant_index = self._current_assistant_index
             self.send_messages([VoiceAssistantRequest(start=True)])
-            self._is_streaming_audio = True
+            self._start_audio_stream()
             self._pipeline_active = True
             _LOGGER.debug("Continuing conversation")
         else:
@@ -554,6 +775,11 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _play_timer_finished(self) -> None:
         if not self._timer_finished:
+            self.unduck()
+            return
+
+        if (not self.state.timer_sound_enabled) or (not self.state.timer_finished_sound):
+            self._timer_finished = False
             self.unduck()
             return
 
@@ -568,7 +794,7 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
 
         self._disconnect_event.set()
-        self._is_streaming_audio = False
+        self._stop_audio_stream()
         self._tts_url = None
         self._tts_played = False
         self._continue_conversation = False
@@ -593,6 +819,10 @@ class VoiceSatelliteProtocol(APIServer):
 
         if self.state.mute_switch_entity is not None:
             self.state.mute_switch_entity.sync_with_state()
+        if self.state.wake_sound_switch_entity is not None:
+            self.state.wake_sound_switch_entity.sync_with_state()
+        if self.state.timer_sound_switch_entity is not None:
+            self.state.timer_sound_switch_entity.sync_with_state()
 
         _LOGGER.info("Disconnected from Home Assistant; waiting for reconnection")
 
