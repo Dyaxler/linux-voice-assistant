@@ -1,13 +1,16 @@
-"""Tests for openWakeWord (CI-safe: mocks native TFLite layer)."""
+"""Tests for openWakeWord (CI-safe: mocks native TFLite layer end-to-end)."""
+
+from __future__ import annotations
 
 import wave
 from pathlib import Path
-from unittest.mock import MagicMock, patch
-
+from unittest.mock import patch
+import ctypes as C
 import numpy as np
 
 from linux_voice_assistant.util import is_arm
 
+# Paths (unchanged)
 _TESTS_DIR = Path(__file__).parent
 _REPO_DIR = _TESTS_DIR.parent
 _OWW_DIR = _REPO_DIR / "wakewords" / "openWakeWord"
@@ -19,90 +22,150 @@ else:
 
 libtensorflowlite_c_path = _LIB_DIR / "libtensorflowlite_c.so"
 
+# Shapes/constants used by production code
+MEL_SAMPLES = 1760
+NUM_MELS = 32
+EMB_FEATURES = 76
+WW_FEATURES = 96
+WW_INPUT_WINDOWS = 8  # what openwakeword.py expects to read from input tensor shape
+
+
+class _FakeModel:
+    __slots__ = ("kind",)
+
+    def __init__(self, kind: str):
+        self.kind = kind  # "mel" | "emb" | "ww"
+
+
+class _FakeInterpreter:
+    __slots__ = ("kind",)
+
+    def __init__(self, kind: str):
+        self.kind = kind  # "mel" | "emb" | "ww"
+
+
+class _FakeTensor:
+    __slots__ = ("kind",)
+
+    def __init__(self, kind: str):
+        self.kind = kind  # "mel_in"|"mel_out"|"emb_in"|"emb_out"|"ww_in"|"ww_out"
+
+
+class _FakeLib:
+    """
+    Minimal fake of the TFLite C API surface that openwakeword.py uses.
+    Returns Python objects for model/interpreter/tensor "handles" and
+    writes deterministic float data into provided buffers.
+    """
+
+    def __init__(self):
+        # One set of tensors per "kind"
+        self._mel_in = _FakeTensor("mel_in")
+        self._mel_out = _FakeTensor("mel_out")
+        self._emb_in = _FakeTensor("emb_in")
+        self._emb_out = _FakeTensor("emb_out")
+        self._ww_in = _FakeTensor("ww_in")
+        self._ww_out = _FakeTensor("ww_out")
+
+    # --- Model & interpreter management ---
+
+    def TfLiteModelCreateFromFile(self, path_bytes):
+        # Decide model kind from filename suffix
+        try:
+            p = path_bytes.decode() if isinstance(path_bytes, (bytes, bytearray)) else str(path_bytes)
+        except Exception:
+            p = str(path_bytes)
+        if p.endswith("melspectrogram.tflite"):
+            return _FakeModel("mel")
+        if p.endswith("embedding_model.tflite"):
+            return _FakeModel("emb")
+        # any other (e.g., okay_nabu.tflite) treated as wake-word model
+        return _FakeModel("ww")
+
+    def TfLiteInterpreterCreate(self, model, _opts):
+        return _FakeInterpreter(model.kind)
+
+    def TfLiteInterpreterAllocateTensors(self, _interp):
+        return 0  # OK
+
+    # --- Tensors ---
+
+    def TfLiteInterpreterGetInputTensor(self, interp, _index):
+        return {
+            "mel": self._mel_in,
+            "emb": self._emb_in,
+            "ww": self._ww_in,
+        }[interp.kind]
+
+    def TfLiteInterpreterGetOutputTensor(self, interp, _index):
+        return {
+            "mel": self._mel_out,
+            "emb": self._emb_out,
+            "ww": self._ww_out,
+        }[interp.kind]
+
+    # --- Shapes/dims for WW input tensor ---
+
+    def TfLiteTensorNumDims(self, tensor):
+        # Only used for ww_in
+        return 3
+
+    def TfLiteTensorDim(self, tensor, i):
+        # WW input shape [1, WW_INPUT_WINDOWS, WW_FEATURES]
+        dims = (1, WW_INPUT_WINDOWS, WW_FEATURES)
+        return dims[i]
+
+    # --- Resize (used by mel/emb) ---
+
+    def TfLiteInterpreterResizeInputTensor(self, _interp, _tensor_index, _dims, _ndims):
+        return 0  # noop/OK
+
+    # --- Byte sizes for outputs ---
+
+    def TfLiteTensorByteSize(self, tensor):
+        if tensor.kind == "mel_out":
+            # (windows * NUM_MELS) floats; production reshapes to (1,1,-1, NUM_MELS)
+            return (MEL_SAMPLES * NUM_MELS) * 4
+        if tensor.kind == "emb_out":
+            # (EMB_FEATURES * WW_FEATURES) floats; reshaped to (1,1,-1, WW_FEATURES)
+            return (EMB_FEATURES * WW_FEATURES) * 4
+        # ww_out: single float probability
+        return 4
+
+    # --- Copies ---
+
+    def TfLiteTensorCopyFromBuffer(self, _tensor, _src_ptr, _nbytes):
+        # We don't need to capture the content for this test
+        return 0
+
+    def TfLiteInterpreterInvoke(self, _interp):
+        return 0  # OK
+
+    def TfLiteTensorCopyToBuffer(self, tensor, dst_void_p, nbytes):
+        # Write deterministic float data directly into provided buffer address.
+        buf = (C.c_char * nbytes).from_address(dst_void_p.value)
+
+        if tensor.kind == "mel_out":
+            arr = np.linspace(0.0, 1.0, nbytes // 4, dtype=np.float32).tobytes()
+            buf[: len(arr)] = arr
+            return 0
+
+        if tensor.kind == "emb_out":
+            arr = np.linspace(0.0, 0.5, nbytes // 4, dtype=np.float32).tobytes()
+            buf[: len(arr)] = arr
+            return 0
+
+        # ww_out: fixed probability 0.8
+        arr = np.array([0.8], dtype=np.float32).tobytes()
+        buf[: len(arr)] = arr
+        return 0
+
 
 def test_features() -> None:
-    """Validate our streaming logic and thresholds without entering native code."""
+    from linux_voice_assistant import wakeword as _wakeword_mod
 
-    # --- Fake native lib behavior surface ---
-    # We simulate the three interpreters (mel, emb, ww) by stubbing out
-    # the TfLite* methods our wrapper calls and returning deterministic outputs.
-
-    # A tiny ring buffer to hold the "last written" input bytes per interpreter
-    class _FakeLib:
-        def __init__(self):
-            self._bytes = {}
-            self._tensors = {"mel_in": object(), "mel_out": object(),
-                             "emb_in": object(), "emb_out": object(),
-                             "ww_in": object(),  "ww_out": object()}
-            self._status_ok = 0
-
-        # Model / interpreter
-        def TfLiteModelCreateFromFile(self, _path): return object()
-        def TfLiteInterpreterCreate(self, _model, _opts): return object()
-        def TfLiteInterpreterAllocateTensors(self, _interp): return self._status_ok
-
-        # Tensors
-        def TfLiteInterpreterGetInputTensor(self, _interp, _idx):  # select by id
-            return {"mel": self._tensors["mel_in"],
-                    "emb": self._tensors["emb_in"],
-                    "ww":  self._tensors["ww_in"]}.get(getattr(_interp, "_kind", "ww"), self._tensors["ww_in"])
-
-        def TfLiteInterpreterGetOutputTensor(self, _interp, _idx):
-            return {"mel": self._tensors["mel_out"],
-                    "emb": self._tensors["emb_out"],
-                    "ww":  self._tensors["ww_out"]}.get(getattr(_interp, "_kind", "ww"), self._tensors["ww_out"])
-
-        # Shapes
-        def TfLiteTensorNumDims(self, _tensor): return 3
-        def TfLiteTensorDim(self, _tensor, i):
-            # WW input shape [1, 8, 96]
-            return (1, 8, 96)[i]
-
-        # IO sizes
-        def TfLiteTensorByteSize(self, tensor):
-            # mel_out:  (1 * 1 * 1760 * 32) * 4 bytes = 225,280
-            # emb_out:  (1 * 1 * 76   * 96) * 4 bytes = 29,184
-            # ww_out:   (1) * 4 bytes
-            if tensor is self._tensors["mel_out"]:
-                return (1760 * 32) * 4
-            if tensor is self._tensors["emb_out"]:
-                return (76 * 96) * 4
-            return 4
-
-        # Copies
-        def TfLiteTensorCopyFromBuffer(self, tensor, src_ptr, nbytes):
-            self._bytes[id(tensor)] = (C_char_from(src_ptr, nbytes), nbytes)
-            return self._status_ok
-
-        def TfLiteInterpreterInvoke(self, _interp):
-            return self._status_ok
-
-        def TfLiteTensorCopyToBuffer(self, tensor, dst_ptr, nbytes):
-            # Produce deterministic floats into dst based on tensor kind.
-            dst = (C.c_char * nbytes).from_address(C.addressof(dst_ptr.contents))
-            if tensor is self._tensors["mel_out"]:
-                # mel: fill with small ramp
-                arr = (np.linspace(0, 1, nbytes // 4, dtype=np.float32)).tobytes()
-                dst[:len(arr)] = arr
-            elif tensor is self._tensors["emb_out"]:
-                # emb: also a ramp
-                arr = (np.linspace(0, 0.5, nbytes // 4, dtype=np.float32)).tobytes()
-                dst[:len(arr)] = arr
-            else:
-                # ww_out: probability ~0.8
-                arr = (np.array([0.8], dtype=np.float32)).tobytes()
-                dst[:len(arr)] = arr
-            return self._status_ok
-
-    # helpers for copy-from-buffer capture
-    import ctypes as C
-    def C_char_from(ptr, nbytes):
-        return (C.c_char * nbytes).from_address(C.addressof(ptr.contents))[:]
-
-    fake = _FakeLib()
-
-    # Patch the base class to use our fake C lib
-    with patch("linux_voice_assistant.wakeword.TfLiteWakeWord.__init__", lambda self, p: setattr(self, "lib", fake)):
+    with patch.object(_wakeword_mod.TfLiteWakeWord, "__init__", lambda self, p: setattr(self, "lib", _FakeLib())):
+        # Import after patch to ensure the class uses our fake lib
         from linux_voice_assistant.openwakeword import OpenWakeWordFeatures, OpenWakeWord
 
         features = OpenWakeWordFeatures(
@@ -110,6 +173,7 @@ def test_features() -> None:
             embedding_model=_OWW_DIR / "embedding_model.tflite",
             libtensorflowlite_c_path=libtensorflowlite_c_path,
         )
+
         ww = OpenWakeWord(
             id="okay_nabu",
             wake_word="okay nabu",
@@ -123,7 +187,7 @@ def test_features() -> None:
             assert wav_file.getsampwidth() == 2
             assert wav_file.getnchannels() == 1
 
-            # Feed all audio at once (your code slides internally)
+            # Feed all frames; production code slides internally
             for embeddings in features.process_streaming(
                 wav_file.readframes(wav_file.getnframes())
             ):
