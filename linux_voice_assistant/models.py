@@ -291,7 +291,6 @@ class ServerState:
     mute_switch_entity: "Optional[MuteSwitchEntity]" = None
     wake_word_library_entity: "Optional[WakeWordLibrarySelectEntity]" = None
     wake_words_changed: bool = False
-    refractory_seconds: float = 2.0
     muted: bool = False
     connected: bool = False
     volume: float = 1.0

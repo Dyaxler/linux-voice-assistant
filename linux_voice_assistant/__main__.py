@@ -5,7 +5,6 @@ import json
 import logging
 import signal
 import threading
-import time
 from contextlib import suppress
 from pathlib import Path
 from queue import Queue
@@ -49,12 +48,6 @@ async def main() -> None:
     parser.add_argument("--audio-input-block-size", type=int, default=1024)
     parser.add_argument("--audio-output-device", help="mpv name for output device")
     parser.add_argument(
-        "--refractory-seconds",
-        default=2.0,
-        type=float,
-        help="Seconds before wake word can be activated again",
-    )
-    parser.add_argument(
         "--stop-model",
         default="stop",
         help=(
@@ -94,7 +87,10 @@ async def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+
+    if unknown_args:
+        _LOGGER.debug("Ignoring unknown arguments: %s", unknown_args)
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
     _LOGGER.debug(args)
@@ -266,7 +262,6 @@ async def main() -> None:
         libtensorflowlite_c_path=libtensorflowlite_c_path,
         oww_melspectrogram_path=Path(args.oww_melspectrogram_model),
         oww_embedding_path=Path(args.oww_embedding_model),
-        refractory_seconds=args.refractory_seconds,
         volume=initial_volume,
         preferred_default_model_ids=preferred_default_model_ids,
         wake_word_sensitivity=preferences.wake_word_sensitivity,
@@ -349,6 +344,15 @@ async def main() -> None:
             _request_shutdown("KeyboardInterrupt")
     finally:
         stop_event.set()
+        if state.satellite is not None:
+            try:
+                state.satellite.reset_pipeline(
+                    "shutdown",
+                    notify_finished=False,
+                    reset_assistant_index=True,
+                )
+            except Exception:  # pragma: no cover - defensive safety net
+                _LOGGER.exception("Failed to reset pipeline during shutdown")
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
         for sig in registered_signals:
@@ -371,8 +375,6 @@ def process_audio(state: ServerState):
     oww_features: Optional[OpenWakeWordFeatures] = None
     oww_inputs: List[np.ndarray] = []
     has_oww = False
-
-    last_active: Optional[float] = None
 
     try:
         while True:
@@ -434,13 +436,8 @@ def process_audio(state: ServerState):
                                 break
 
                     if activated and not state.muted:
-                        # Check refractory
-                        now = time.monotonic()
-                        if (last_active is None) or (
-                            (now - last_active) > state.refractory_seconds
-                        ):
-                            state.satellite.wakeup(wake_word)
-                            last_active = now
+                        state.satellite.wakeup(wake_word)
+                        break
 
                 # Always process to keep state correct
                 stopped = False

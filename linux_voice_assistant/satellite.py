@@ -10,6 +10,8 @@ import time
 from collections.abc import Iterable
 from typing import Dict, List, Optional, Union
 
+from dataclasses import dataclass
+
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     ButtonCommandRequest,
@@ -69,6 +71,17 @@ _LOGGER = logging.getLogger(__name__)
 
 PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
 
+_WAKE_RESTART_COOLDOWN = 0.5
+_STT_NO_SPEECH_TIMEOUT = 5.0
+
+
+@dataclass
+class QueuedWakeWord:
+    phrase: str
+    assistant_index: int
+    sound_played: bool = False
+    timestamp: float = 0.0
+
 
 class VoiceSatelliteProtocol(APIServer):
 
@@ -85,6 +98,19 @@ class VoiceSatelliteProtocol(APIServer):
         self._current_assistant_index = 0
         self._pending_assistant_index: Optional[int] = None
         self._disconnect_event = asyncio.Event()
+        self._pipeline_restart_available = False
+        self._last_wake_event_time: Optional[float] = None
+        self._heard_speech_during_stt = False
+        self._pending_purge_events = 0
+        self._stt_timeout_handle: Optional[asyncio.TimerHandle] = None
+        self._queued_wake_word: Optional[QueuedWakeWord] = None
+        self._restart_waiting_for_ack = False
+        self._queued_wake_word_pending_start = False
+        self._suppress_stale_events = False
+        self._last_wake_ignore_reason: Optional[str] = None
+        self._last_wake_ignore_time = 0.0
+        self._last_ignored_event_type: Optional[VoiceAssistantEventType] = None
+        self._last_ignored_event_time = 0.0
 
         self.state = state
         self.state.connected = False
@@ -290,6 +316,11 @@ class VoiceSatelliteProtocol(APIServer):
                 self.state.entities.append(restart_button)
 
         self.state.satellite = self
+        self.reset_pipeline(
+            "startup",
+            notify_finished=False,
+            reset_assistant_index=True,
+        )
 
     def _assistant_index_for_wake_word(self, wake_word_id: str) -> int:
         """Return the assistant index associated with a wake word id."""
@@ -468,6 +499,36 @@ class VoiceSatelliteProtocol(APIServer):
     ) -> None:
         _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
 
+        if (
+            self._suppress_stale_events
+            and event_type
+            not in (
+                VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END,
+                VoiceAssistantEventType.VOICE_ASSISTANT_ERROR,
+            )
+        ):
+            now = time.monotonic()
+            if (
+                self._last_ignored_event_type != event_type
+                or (now - self._last_ignored_event_time) >= 0.5
+            ):
+                _LOGGER.debug(
+                    "Ignoring voice event %s while waiting for pipeline shutdown",
+                    event_type.name,
+                )
+                self._last_ignored_event_type = event_type
+                self._last_ignored_event_time = now
+            return
+
+        if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
+            _LOGGER.warning("Voice assistant error: %s", data)
+            self._purge_active_pipeline(
+                "voice assistant error",
+                notify_finished=False,
+                record_pending_finish=False,
+                send_stop_request=True,
+            )
+            return
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
             self._tts_url = data.get("url")
             self._tts_played = False
@@ -481,30 +542,81 @@ class VoiceSatelliteProtocol(APIServer):
 
             self._current_assistant_index = assistant_index
             self._pending_assistant_index = assistant_index
+            self._restart_waiting_for_ack = False
+            self._queued_wake_word_pending_start = False
+            self._queued_wake_word = None
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_START:
+            self._heard_speech_during_stt = False
+            self._schedule_stt_timeout()
             self._start_audio_stream()
+        elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_START:
+            self._heard_speech_during_stt = True
+            self._cancel_stt_timeout()
         elif event_type in (
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_VAD_END,
             VoiceAssistantEventType.VOICE_ASSISTANT_STT_END,
         ):
+            self._cancel_stt_timeout()
             self._stop_audio_stream()
+            if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_STT_END:
+                if self._has_nonempty_speech_text(data):
+                    self._heard_speech_during_stt = True
+
+                if not self._heard_speech_during_stt and self._pipeline_active:
+                    _LOGGER.debug(
+                        "No speech detected during STT; resetting pipeline"
+                    )
+                    self._purge_active_pipeline(
+                        "no speech detected",
+                        notify_finished=True,
+                        record_pending_finish=True,
+                        send_stop_request=True,
+                    )
+                    return
+
+                self._heard_speech_during_stt = False
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_PROGRESS:
             if data.get("tts_start_streaming") == "1":
                 # Start streaming early
                 self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_INTENT_END:
-            if data.get("continue_conversation") == "1":
+            if self._pipeline_active and data.get("continue_conversation") == "1":
                 self._continue_conversation = True
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_TTS_END:
             self._tts_url = data.get("url")
             self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
             self._stop_audio_stream()
-            if not self._tts_played:
+            if self._pending_purge_events > 0:
+                self._pending_purge_events -= 1
+                _LOGGER.debug(
+                    "Skipping pipeline finish due to pending purge (remaining=%s)",
+                    self._pending_purge_events,
+                )
+                if self._pending_purge_events == 0:
+                    self._suppress_stale_events = False
+                    self._last_ignored_event_type = None
+                if self._queued_wake_word is not None:
+                    if self._restart_waiting_for_ack:
+                        _LOGGER.debug(
+                            "Restart queued wake word after pipeline end"
+                        )
+                        self._restart_waiting_for_ack = False
+                        self._start_queued_wake_word()
+                    elif self._queued_wake_word_pending_start:
+                        _LOGGER.debug(
+                            "Starting queued wake word after pipeline end"
+                        )
+                        self._start_queued_wake_word()
+            elif not self._tts_played:
                 self._tts_finished()
 
-            self._tts_played = False
-            self._pending_assistant_index = None
+            if not (self._restart_waiting_for_ack or self._queued_wake_word_pending_start):
+                self._pending_assistant_index = None
+            if not self._queued_wake_word_pending_start:
+                self._pipeline_restart_available = False
+            if not self._restart_waiting_for_ack:
+                self._last_wake_event_time = None
 
         # TODO: handle error
 
@@ -684,6 +796,127 @@ class VoiceSatelliteProtocol(APIServer):
             self._audio_stream_open = False
         self._is_streaming_audio = False
 
+    def _purge_active_pipeline(
+        self,
+        reason: str,
+        *,
+        notify_finished: bool,
+        reset_continue: bool = True,
+        record_pending_finish: bool = False,
+        reset_assistant_index: bool = False,
+        clear_tts_flag: bool = True,
+        preserve_restart_queue: bool = False,
+        send_stop_request: bool = False,
+    ) -> None:
+        _LOGGER.debug("Purging pipeline (%s)", reason)
+
+        self._cancel_stt_timeout()
+
+        self._stop_audio_stream()
+
+        try:
+            self.state.tts_player.stop()
+        except Exception:  # pragma: no cover - defensive safety net
+            _LOGGER.exception("Failed to stop TTS playback during pipeline purge")
+
+        self.state.stop_word.is_active = False
+
+        if reset_continue:
+            self._continue_conversation = False
+
+        if clear_tts_flag:
+            self._tts_played = False
+
+        self._pipeline_active = False
+        self._pipeline_restart_available = False
+        self._pending_assistant_index = None
+        self._tts_url = None
+        self._timer_finished = False
+        self._last_wake_event_time = None
+        self._heard_speech_during_stt = False
+        self._restart_waiting_for_ack = False
+
+        if reset_assistant_index:
+            self._current_assistant_index = 0
+
+        if record_pending_finish:
+            self._pending_purge_events += 1
+            self._suppress_stale_events = True
+        else:
+            self._suppress_stale_events = False
+
+        should_notify = notify_finished and self.state.connected
+        should_send_stop = send_stop_request and self.state.connected
+
+        if should_send_stop:
+            self.send_messages([VoiceAssistantRequest(start=False)])
+
+        if should_notify:
+            self.send_messages([VoiceAssistantAnnounceFinished()])
+
+        try:
+            self.unduck()
+        except Exception:  # pragma: no cover - defensive safety net
+            _LOGGER.exception("Failed to unduck audio during pipeline purge")
+
+        if not record_pending_finish and self._pending_purge_events:
+            # Ensure stale counters do not linger when not expecting follow-up events.
+            self._pending_purge_events = 0
+            self._suppress_stale_events = False
+            self._last_ignored_event_type = None
+
+        if not preserve_restart_queue:
+            self._queued_wake_word = None
+            self._queued_wake_word_pending_start = False
+
+    def reset_pipeline(
+        self,
+        reason: str,
+        *,
+        notify_finished: bool = False,
+        reset_assistant_index: bool = False,
+    ) -> None:
+        """Reset the active pipeline state without expecting follow-up events."""
+
+        self._purge_active_pipeline(
+            reason,
+            notify_finished=notify_finished,
+            reset_assistant_index=reset_assistant_index,
+            record_pending_finish=False,
+        )
+
+    @staticmethod
+    def _has_nonempty_speech_text(data: Dict[str, str]) -> bool:
+        for key in (
+            "stt_output_text",
+            "stt_output",
+            "stt_text",
+            "text",
+            "transcript",
+        ):
+            value = data.get(key)
+            if value and value.strip():
+                return True
+
+        for key in ("speech_detected", "has_speech", "stt_speech_detected"):
+            value = data.get(key)
+            if value and value.strip().lower() in {"1", "true", "yes"}:
+                return True
+
+        return False
+
+    def _log_wake_ignore(self, message: str) -> None:
+        now = time.monotonic()
+        if (
+            self._last_wake_ignore_reason == message
+            and (now - self._last_wake_ignore_time) < 0.5
+        ):
+            return
+
+        self._last_wake_ignore_reason = message
+        self._last_wake_ignore_time = now
+        _LOGGER.debug(message)
+
     def wakeup(self, wake_word: Union[MicroWakeWord, OpenWakeWord]) -> None:
         if self._timer_finished:
             # Stop timer instead
@@ -696,9 +929,7 @@ class VoiceSatelliteProtocol(APIServer):
             # Don't respond to wake words when muted (voice_assistant.stop behavior)
             return
 
-        if self._pipeline_active:
-            _LOGGER.debug("Ignoring wake word while pipeline is active")
-            return
+        now = time.monotonic()
 
         wake_word_phrase = wake_word.wake_word
         wake_word_id = getattr(wake_word, "id", None)
@@ -707,30 +938,143 @@ class VoiceSatelliteProtocol(APIServer):
         else:
             assistant_index = 0
 
-        self._pending_assistant_index = assistant_index
-        _LOGGER.debug("Detected wake word: %s", wake_word_phrase)
+        if self._pipeline_active:
+            if not self._pipeline_restart_available:
+                self._log_wake_ignore("Ignoring wake word while pipeline is active")
+                return
+
+            if (
+                self._last_wake_event_time is not None
+                and (now - self._last_wake_event_time) < _WAKE_RESTART_COOLDOWN
+            ):
+                self._log_wake_ignore(
+                    "Ignoring wake word restart request due to cooldown"
+                )
+                return
+
+            _LOGGER.debug(
+                "Wake word detected while pipeline active; restarting conversation"
+            )
+            self._queued_wake_word = QueuedWakeWord(
+                phrase=wake_word_phrase,
+                assistant_index=assistant_index,
+                timestamp=now,
+            )
+            self._queued_wake_word_pending_start = True
+            self._purge_active_pipeline(
+                "wake word restart",
+                notify_finished=True,
+                record_pending_finish=True,
+                preserve_restart_queue=True,
+                send_stop_request=True,
+            )
+            return
+
+        if self._pending_purge_events > 0:
+            self._log_wake_ignore(
+                "Ignoring wake word while previous pipeline is finishing"
+            )
+            return
+
+        if self._restart_waiting_for_ack or self._queued_wake_word_pending_start:
+            self._log_wake_ignore("Ignoring wake word while restart is pending")
+            return
+
+        self._pipeline_restart_available = True
+        self._queued_wake_word = QueuedWakeWord(
+            phrase=wake_word_phrase,
+            assistant_index=assistant_index,
+            timestamp=now,
+        )
+        self._queued_wake_word_pending_start = True
+        self._start_queued_wake_word(now=now)
+
+    def _start_queued_wake_word(self, *, now: Optional[float] = None) -> None:
+        if self._queued_wake_word is None:
+            return
+
+        queued = self._queued_wake_word
+        if now is None:
+            now = time.monotonic()
+
+        queued.timestamp = now
+        self._last_wake_event_time = now
+        self._pending_assistant_index = queued.assistant_index
+        self._queued_wake_word_pending_start = False
+        self._last_wake_ignore_reason = None
+
+        _LOGGER.debug("Detected wake word: %s", queued.phrase)
         self.send_messages(
-            [VoiceAssistantRequest(start=True, wake_word_phrase=wake_word_phrase)]
+            [VoiceAssistantRequest(start=True, wake_word_phrase=queued.phrase)]
         )
         self.duck()
-        self._start_audio_stream()
-        self._pipeline_active = True
-        if self.state.wake_sound_enabled and self.state.wakeup_sound:
+
+        if (
+            self.state.wake_sound_enabled
+            and self.state.wakeup_sound
+            and not queued.sound_played
+        ):
             self.state.tts_player.play(self.state.wakeup_sound)
+            queued.sound_played = True
+
+        self._restart_waiting_for_ack = True
+
+    def _schedule_stt_timeout(self) -> None:
+        loop = getattr(self, "_loop", None)
+        if loop is None:
+            return
+
+        self._cancel_stt_timeout()
+        self._stt_timeout_handle = loop.call_later(
+            _STT_NO_SPEECH_TIMEOUT, self._handle_stt_timeout
+        )
+
+    def _cancel_stt_timeout(self) -> None:
+        if self._stt_timeout_handle is not None:
+            self._stt_timeout_handle.cancel()
+            self._stt_timeout_handle = None
+
+    def _handle_stt_timeout(self) -> None:
+        self._stt_timeout_handle = None
+        if not self._pipeline_active or self._heard_speech_during_stt:
+            return
+
+        _LOGGER.debug("STT timeout without detected speech; purging pipeline")
+        self._purge_active_pipeline(
+            "stt timeout without speech",
+            notify_finished=True,
+            record_pending_finish=True,
+            send_stop_request=True,
+        )
 
     def stop(self) -> None:
-        self._stop_audio_stream()
-        self.state.stop_word.is_active = False
-        self.state.tts_player.stop()
-        self._continue_conversation = False
-        self._pipeline_active = False
-
         if self._timer_finished:
-            self._timer_finished = False
             _LOGGER.debug("Stopping timer finished sound")
-        else:
+        elif (
+            self._pipeline_active
+            or self._audio_stream_open
+            or self._is_streaming_audio
+            or self._tts_played
+            or self._tts_url
+        ):
             _LOGGER.debug("TTS response stopped manually")
-            self._tts_finished()
+        else:
+            _LOGGER.debug("Stop word received with no active pipeline")
+
+        should_notify = bool(
+            self._pipeline_active
+            or self._audio_stream_open
+            or self._is_streaming_audio
+            or self._tts_played
+            or self._tts_url
+        )
+
+        self._purge_active_pipeline(
+            "stop word",
+            notify_finished=should_notify,
+            record_pending_finish=should_notify,
+            send_stop_request=should_notify,
+        )
 
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
@@ -755,22 +1099,38 @@ class VoiceSatelliteProtocol(APIServer):
             self.state.tts_player.unduck()
 
     def _tts_finished(self) -> None:
-        self.state.stop_word.is_active = False
-        self.send_messages([VoiceAssistantAnnounceFinished()])
+        if (
+            not self._tts_played
+            and not self._continue_conversation
+            and not self._pipeline_active
+        ):
+            _LOGGER.debug(
+                "Ignoring TTS finished callback with no active TTS playback",
+            )
+            return
 
+        self.state.stop_word.is_active = False
         continue_conversation = self._continue_conversation
         self._continue_conversation = False
+
+        self.send_messages([VoiceAssistantAnnounceFinished()])
 
         if continue_conversation:
             self._pending_assistant_index = self._current_assistant_index
             self.send_messages([VoiceAssistantRequest(start=True)])
-            self._start_audio_stream()
-            self._pipeline_active = True
+            self._pipeline_restart_available = True
+            self._last_wake_event_time = None
+            self._restart_waiting_for_ack = True
             _LOGGER.debug("Continuing conversation")
         else:
-            self._pipeline_active = False
-            self.unduck()
-
+            self._purge_active_pipeline(
+                "tts finished",
+                notify_finished=False,
+                reset_continue=False,
+                record_pending_finish=False,
+                clear_tts_flag=False,
+            )
+        self._tts_played = False
         _LOGGER.debug("TTS response finished")
 
     def _play_timer_finished(self) -> None:
@@ -794,12 +1154,13 @@ class VoiceSatelliteProtocol(APIServer):
         super().connection_lost(exc)
 
         self._disconnect_event.set()
-        self._stop_audio_stream()
-        self._tts_url = None
-        self._tts_played = False
-        self._continue_conversation = False
-        self._timer_finished = False
-        self._pipeline_active = False
+        self._purge_active_pipeline(
+            "connection lost",
+            notify_finished=False,
+            record_pending_finish=False,
+            reset_assistant_index=True,
+        )
+        self._pending_purge_events = 0
 
         # Stop any ongoing audio playback and wake/stop word processing.
         try:
@@ -807,12 +1168,6 @@ class VoiceSatelliteProtocol(APIServer):
         except Exception:  # pragma: no cover - defensive safety net
             _LOGGER.exception("Failed to stop music player during disconnect")
 
-        try:
-            self.state.tts_player.stop()
-        except Exception:  # pragma: no cover - defensive safety net
-            _LOGGER.exception("Failed to stop TTS player during disconnect")
-
-        self.state.stop_word.is_active = False
         self.state.connected = False
         if self.state.satellite is self:
             self.state.satellite = None
