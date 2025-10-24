@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 import ctypes as C
 import numpy as np
+import struct
 
 from linux_voice_assistant.util import is_arm
 
@@ -25,9 +26,31 @@ libtensorflowlite_c_path = _LIB_DIR / "libtensorflowlite_c.so"
 # Shapes/constants used by production code
 MEL_SAMPLES = 1760
 NUM_MELS = 32
-EMB_FEATURES = 76
-WW_FEATURES = 96
-WW_INPUT_WINDOWS = 8  # what openwakeword.py expects to read from input tensor shape
+EMB_FEATURES = 76           # typical # of time frames from embedding model per step
+WW_FEATURES = 96            # embedding feature dimension
+WW_INPUT_WINDOWS = 8        # wake-word model consumes 8 windows of 96-d embeddings
+MEL_WINDOWS_PER_CHUNK = 76  # return 76 frames per step
+
+
+def _addr_of_void_p(v: C.c_void_p | int) -> int:
+    if isinstance(v, int):
+        return v
+    return int(getattr(v, "value", 0) or 0)
+
+
+def _as_size_t(n) -> int:
+    """Normalize int/ctypes/bytes to a Python int."""
+    if isinstance(n, int):
+        return n
+    val = getattr(n, "value", None)
+    if isinstance(val, int):
+        return int(val)
+    if isinstance(n, (bytes, bytearray)):
+        if len(n) == 8:
+            return struct.unpack("<Q", n)[0]
+        if len(n) == 4:
+            return struct.unpack("<I", n)[0]
+    return int(n)
 
 
 class _FakeModel:
@@ -69,9 +92,7 @@ class _FakeLib:
         self._status_ok = 0
 
     # --- Model & interpreter management ---
-
     def TfLiteModelCreateFromFile(self, path_bytes):
-        # Decide model kind from filename suffix
         try:
             p = path_bytes.decode() if isinstance(path_bytes, (bytes, bytearray)) else str(path_bytes)
         except Exception:
@@ -80,7 +101,6 @@ class _FakeLib:
             return _FakeModel("mel")
         if p.endswith("embedding_model.tflite"):
             return _FakeModel("emb")
-        # any other (e.g., okay_nabu.tflite) treated as wake-word model
         return _FakeModel("ww")
 
     def TfLiteInterpreterCreate(self, model, _opts):
@@ -90,25 +110,14 @@ class _FakeLib:
         return self._status_ok  # OK
 
     # --- Tensors ---
-
     def TfLiteInterpreterGetInputTensor(self, interp, _index):
-        return {
-            "mel": self._mel_in,
-            "emb": self._emb_in,
-            "ww": self._ww_in,
-        }[interp.kind]
+        return {"mel": self._mel_in, "emb": self._emb_in, "ww": self._ww_in}[interp.kind]
 
     def TfLiteInterpreterGetOutputTensor(self, interp, _index):
-        return {
-            "mel": self._mel_out,
-            "emb": self._emb_out,
-            "ww": self._ww_out,
-        }[interp.kind]
+        return {"mel": self._mel_out, "emb": self._emb_out, "ww": self._ww_out}[interp.kind]
 
     # --- Shapes/dims for WW input tensor ---
-
     def TfLiteTensorNumDims(self, _tensor):
-        # Only used for ww_in
         return 3
 
     def TfLiteTensorDim(self, _tensor, i):
@@ -117,55 +126,52 @@ class _FakeLib:
         return dims[i]
 
     # --- Resize (used by mel/emb) ---
-
     def TfLiteInterpreterResizeInputTensor(self, _interp, _tensor_index, _dims, _ndims):
         return self._status_ok  # noop/OK
 
     # --- Byte sizes for outputs ---
-
     def TfLiteTensorByteSize(self, tensor):
         if tensor.kind == "mel_out":
-            # (MEL_SAMPLES * NUM_MELS) floats; production reshapes to (1,1,-1, NUM_MELS)
-            return (MEL_SAMPLES * NUM_MELS) * 4
+            # return 76 frames of 32 mels
+            return (MEL_WINDOWS_PER_CHUNK * NUM_MELS) * 4
         if tensor.kind == "emb_out":
-            # (EMB_FEATURES * WW_FEATURES) floats; reshaped to (1,1,-1, WW_FEATURES)
+            # 76 time frames of 96-d embeddings
             return (EMB_FEATURES * WW_FEATURES) * 4
         # ww_out: single float probability
         return 4
 
-    # --- Misc TFLite bits some wrappers call; keep safe defaults ---
-
+    # --- Misc TFLite bits ---
     def TfLiteVersion(self):
         return b"Fake-TfLite-0.0"
 
     def TfLiteTensorType(self, _tensor):
-        # 1 == kTfLiteFloat32
-        return 1
+        return 1  # kTfLiteFloat32
 
     def TfLiteTensorData(self, _tensor):
-        # Return a non-null pointer when code branches try to read raw data ptrs
         return C.cast(C.create_string_buffer(4), C.c_void_p)
 
     # --- Copies ---
-
     def TfLiteTensorCopyFromBuffer(self, _tensor, _src_ptr, _nbytes):
-        # We don't need to capture the content for this test
         return self._status_ok
 
     def TfLiteInterpreterInvoke(self, _interp):
         return self._status_ok  # OK
 
     def TfLiteTensorCopyToBuffer(self, tensor, dst_void_p, nbytes):
-        # Write deterministic float data directly into provided buffer address.
-        buf = (C.c_char * nbytes).from_address(dst_void_p.value)
+        addr = _addr_of_void_p(dst_void_p)
+        assert addr != 0, "Fake TFLite: destination pointer address was null/unknown"
+        n = _as_size_t(nbytes)
+        buf = (C.c_char * n).from_address(addr)
 
         if tensor.kind == "mel_out":
-            arr = np.linspace(0.0, 1.0, nbytes // 4, dtype=np.float32).tobytes()
+            # ramp over 76*32 floats
+            arr = np.linspace(0.0, 1.0, n // 4, dtype=np.float32).tobytes()
             buf[: len(arr)] = arr
             return self._status_ok
 
         if tensor.kind == "emb_out":
-            arr = np.linspace(0.0, 0.5, nbytes // 4, dtype=np.float32).tobytes()
+            # ramp over 76*96 floats
+            arr = np.linspace(0.0, 0.5, n // 4, dtype=np.float32).tobytes()
             buf[: len(arr)] = arr
             return self._status_ok
 
