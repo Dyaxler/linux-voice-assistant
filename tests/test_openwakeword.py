@@ -66,6 +66,7 @@ class _FakeLib:
         self._emb_out = _FakeTensor("emb_out")
         self._ww_in = _FakeTensor("ww_in")
         self._ww_out = _FakeTensor("ww_out")
+        self._status_ok = 0
 
     # --- Model & interpreter management ---
 
@@ -86,7 +87,7 @@ class _FakeLib:
         return _FakeInterpreter(model.kind)
 
     def TfLiteInterpreterAllocateTensors(self, _interp):
-        return 0  # OK
+        return self._status_ok  # OK
 
     # --- Tensors ---
 
@@ -106,11 +107,11 @@ class _FakeLib:
 
     # --- Shapes/dims for WW input tensor ---
 
-    def TfLiteTensorNumDims(self, tensor):
+    def TfLiteTensorNumDims(self, _tensor):
         # Only used for ww_in
         return 3
 
-    def TfLiteTensorDim(self, tensor, i):
+    def TfLiteTensorDim(self, _tensor, i):
         # WW input shape [1, WW_INPUT_WINDOWS, WW_FEATURES]
         dims = (1, WW_INPUT_WINDOWS, WW_FEATURES)
         return dims[i]
@@ -118,13 +119,13 @@ class _FakeLib:
     # --- Resize (used by mel/emb) ---
 
     def TfLiteInterpreterResizeInputTensor(self, _interp, _tensor_index, _dims, _ndims):
-        return 0  # noop/OK
+        return self._status_ok  # noop/OK
 
     # --- Byte sizes for outputs ---
 
     def TfLiteTensorByteSize(self, tensor):
         if tensor.kind == "mel_out":
-            # (windows * NUM_MELS) floats; production reshapes to (1,1,-1, NUM_MELS)
+            # (MEL_SAMPLES * NUM_MELS) floats; production reshapes to (1,1,-1, NUM_MELS)
             return (MEL_SAMPLES * NUM_MELS) * 4
         if tensor.kind == "emb_out":
             # (EMB_FEATURES * WW_FEATURES) floats; reshaped to (1,1,-1, WW_FEATURES)
@@ -132,14 +133,27 @@ class _FakeLib:
         # ww_out: single float probability
         return 4
 
+    # --- Misc TFLite bits some wrappers call; keep safe defaults ---
+
+    def TfLiteVersion(self):
+        return b"Fake-TfLite-0.0"
+
+    def TfLiteTensorType(self, _tensor):
+        # 1 == kTfLiteFloat32
+        return 1
+
+    def TfLiteTensorData(self, _tensor):
+        # Return a non-null pointer when code branches try to read raw data ptrs
+        return C.cast(C.create_string_buffer(4), C.c_void_p)
+
     # --- Copies ---
 
     def TfLiteTensorCopyFromBuffer(self, _tensor, _src_ptr, _nbytes):
         # We don't need to capture the content for this test
-        return 0
+        return self._status_ok
 
     def TfLiteInterpreterInvoke(self, _interp):
-        return 0  # OK
+        return self._status_ok  # OK
 
     def TfLiteTensorCopyToBuffer(self, tensor, dst_void_p, nbytes):
         # Write deterministic float data directly into provided buffer address.
@@ -148,22 +162,23 @@ class _FakeLib:
         if tensor.kind == "mel_out":
             arr = np.linspace(0.0, 1.0, nbytes // 4, dtype=np.float32).tobytes()
             buf[: len(arr)] = arr
-            return 0
+            return self._status_ok
 
         if tensor.kind == "emb_out":
             arr = np.linspace(0.0, 0.5, nbytes // 4, dtype=np.float32).tobytes()
             buf[: len(arr)] = arr
-            return 0
+            return self._status_ok
 
         # ww_out: fixed probability 0.8
         arr = np.array([0.8], dtype=np.float32).tobytes()
         buf[: len(arr)] = arr
-        return 0
+        return self._status_ok
 
 
 def test_features() -> None:
     from linux_voice_assistant import wakeword as _wakeword_mod
 
+    # Patch base class so its __init__ uses our fake C API.
     with patch.object(_wakeword_mod.TfLiteWakeWord, "__init__", lambda self, p: setattr(self, "lib", _FakeLib())):
         # Import after patch to ensure the class uses our fake lib
         from linux_voice_assistant.openwakeword import OpenWakeWordFeatures, OpenWakeWord
