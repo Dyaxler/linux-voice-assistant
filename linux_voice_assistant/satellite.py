@@ -111,6 +111,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._last_wake_ignore_time = 0.0
         self._last_ignored_event_type: Optional[VoiceAssistantEventType] = None
         self._last_ignored_event_time = 0.0
+        self._run_end_received = True
 
         self.state = state
         self.state.connected = False
@@ -353,8 +354,8 @@ class VoiceSatelliteProtocol(APIServer):
         else:
             # voice_assistant.start_continuous behavior
             _LOGGER.debug("Unmuting voice assistant (voice_assistant.start_continuous)")
-            # Resume normal operation - wake word detection will be active again
-            pass
+            # Resume normal operation - stop word detection will be active again
+            self.state.stop_word.is_active = True
 
     def _refresh_wake_word_libraries(self) -> None:
         libraries = discover_wake_word_libraries(self.state.wakewords_dir)
@@ -530,6 +531,13 @@ class VoiceSatelliteProtocol(APIServer):
             )
             return
         if event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_START:
+            # Enable the stop word for the duration of the pipeline so the
+            # conversation can be cancelled even if Home Assistant delivers
+            # audio via streaming events instead of an announce request.  The
+            # flag will be cleared as part of the general pipeline reset
+            # logic inside ``_purge_active_pipeline`` and ``_tts_finished``.
+            self.state.stop_word.is_active = True
+            self._run_end_received = False
             self._tts_url = data.get("url")
             self._tts_played = False
             self._continue_conversation = False
@@ -586,6 +594,7 @@ class VoiceSatelliteProtocol(APIServer):
             self._tts_url = data.get("url")
             self.play_tts()
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_RUN_END:
+            self._run_end_received = True
             self._stop_audio_stream()
             if self._pending_purge_events > 0:
                 self._pending_purge_events -= 1
@@ -652,6 +661,9 @@ class VoiceSatelliteProtocol(APIServer):
 
             urls.append(msg.media_id)
 
+            # Treat announcements like active TTS playback so the stop word can
+            # cancel them and the normal finish callback logic runs.
+            self._tts_played = True
             self.state.stop_word.is_active = True
             self._continue_conversation = msg.start_conversation
 
@@ -807,6 +819,7 @@ class VoiceSatelliteProtocol(APIServer):
         clear_tts_flag: bool = True,
         preserve_restart_queue: bool = False,
         send_stop_request: bool = False,
+        reactivate_stop_word: bool = True,
     ) -> None:
         _LOGGER.debug("Purging pipeline (%s)", reason)
 
@@ -839,11 +852,13 @@ class VoiceSatelliteProtocol(APIServer):
         if reset_assistant_index:
             self._current_assistant_index = 0
 
-        if record_pending_finish:
+        if record_pending_finish and not self._run_end_received:
             self._pending_purge_events += 1
             self._suppress_stale_events = True
         else:
             self._suppress_stale_events = False
+            if not record_pending_finish:
+                self._run_end_received = True
 
         should_notify = notify_finished and self.state.connected
         should_send_stop = send_stop_request and self.state.connected
@@ -868,6 +883,9 @@ class VoiceSatelliteProtocol(APIServer):
         if not preserve_restart_queue:
             self._queued_wake_word = None
             self._queued_wake_word_pending_start = False
+
+        if reactivate_stop_word and not self.state.muted:
+            self.state.stop_word.is_active = True
 
     def reset_pipeline(
         self,
@@ -1003,6 +1021,11 @@ class VoiceSatelliteProtocol(APIServer):
         self._queued_wake_word_pending_start = False
         self._last_wake_ignore_reason = None
 
+        # Activate the stop word immediately so users can cancel during the
+        # brief window before Home Assistant confirms the pipeline start.
+        self.state.stop_word.is_active = True
+        self.state.stop_word_cooldown_until = 0.0
+        self.state.stop_word_last_detection = 0.0
         _LOGGER.debug("Detected wake word: %s", queued.phrase)
         self.send_messages(
             [VoiceAssistantRequest(start=True, wake_word_phrase=queued.phrase)]
@@ -1048,33 +1071,62 @@ class VoiceSatelliteProtocol(APIServer):
         )
 
     def stop(self) -> None:
-        if self._timer_finished:
-            _LOGGER.debug("Stopping timer finished sound")
-        elif (
-            self._pipeline_active
+        pipeline_running = bool(
+            (self._pipeline_active and not self._run_end_received)
             or self._audio_stream_open
             or self._is_streaming_audio
-            or self._tts_played
-            or self._tts_url
-        ):
-            _LOGGER.debug("TTS response stopped manually")
-        else:
-            _LOGGER.debug("Stop word received with no active pipeline")
-
-        should_notify = bool(
-            self._pipeline_active
-            or self._audio_stream_open
-            or self._is_streaming_audio
-            or self._tts_played
-            or self._tts_url
         )
+
+        awaiting_pipeline_start = self._restart_waiting_for_ack
+        tts_active = bool(self._tts_played or self._tts_url)
+
+        music_playing = self.state.music_player.is_playing
+        finishing_pipeline = self._pending_purge_events > 0
+        stop_music_only = (
+            music_playing
+            and not pipeline_running
+            and not awaiting_pipeline_start
+            and not tts_active
+            and not self._timer_finished
+            and not finishing_pipeline
+        )
+
+        if self._timer_finished:
+            _LOGGER.info("Stop word cancelled timer chime")
+        elif pipeline_running:
+            _LOGGER.info("Stop word cancelling active pipeline")
+        elif awaiting_pipeline_start:
+            _LOGGER.info("Stop word cancelled pending pipeline start")
+        elif tts_active:
+            _LOGGER.info("Stop word stopped pending TTS playback")
+        elif stop_music_only:
+            _LOGGER.info("Stop word stopped media playback")
+        else:
+            _LOGGER.info("Stop word detected with nothing active to cancel")
+
+        should_notify = bool(pipeline_running or tts_active)
 
         self._purge_active_pipeline(
             "stop word",
             notify_finished=should_notify,
-            record_pending_finish=should_notify,
-            send_stop_request=should_notify,
+            record_pending_finish=pipeline_running,
+            send_stop_request=pipeline_running or awaiting_pipeline_start,
         )
+
+        if stop_music_only:
+            try:
+                self.state.music_player.stop()
+                media_entity = self.state.media_player_entity
+                if media_entity is not None:
+                    new_state = media_entity._update_state(
+                        media_entity._determine_state()
+                    )
+                    if self.state.connected:
+                        self.send_messages([new_state])
+            except Exception:  # pragma: no cover - defensive safety net
+                _LOGGER.exception(
+                    "Failed to stop media playback after stop word trigger"
+                )
 
     def play_tts(self) -> None:
         if (not self._tts_url) or self._tts_played:
@@ -1084,6 +1136,8 @@ class VoiceSatelliteProtocol(APIServer):
         _LOGGER.debug("Playing TTS response: %s", self._tts_url)
 
         self.state.stop_word.is_active = True
+        self.state.stop_word_cooldown_until = 0.0
+        self.state.stop_word_last_detection = 0.0
         self.state.tts_player.play(self._tts_url, done_callback=self._tts_finished)
 
     def duck(self) -> None:
@@ -1109,14 +1163,27 @@ class VoiceSatelliteProtocol(APIServer):
             )
             return
 
-        self.state.stop_word.is_active = False
         continue_conversation = self._continue_conversation
         self._continue_conversation = False
+
+        if continue_conversation:
+            # Keep the stop word armed for the follow-up turn so users can
+            # immediately cancel if they change their mind.
+            self.state.stop_word.is_active = True
+            self.state.stop_word_cooldown_until = 0.0
+            self.state.stop_word_last_detection = 0.0
+        else:
+            self.state.stop_word.is_active = False
 
         self.send_messages([VoiceAssistantAnnounceFinished()])
 
         if continue_conversation:
             self._pending_assistant_index = self._current_assistant_index
+            # Ensure the stop word remains active between turns, even before the
+            # pipeline start event reaffirms it.
+            self.state.stop_word.is_active = True
+            self.state.stop_word_cooldown_until = 0.0
+            self.state.stop_word_last_detection = 0.0
             self.send_messages([VoiceAssistantRequest(start=True)])
             self._pipeline_restart_available = True
             self._last_wake_event_time = None

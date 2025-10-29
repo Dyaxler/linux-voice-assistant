@@ -304,6 +304,10 @@ class ServerState:
     timer_sound_switch_entity: "Optional[ConfigSwitchEntity]" = None
     reset_assistant_button_entity: "Optional[ConfigButtonEntity]" = None
     restart_device_button_entity: "Optional[ConfigButtonEntity]" = None
+    stop_word_event_active: bool = False
+    stop_word_last_detection: float = 0.0
+    stop_word_cooldown_until: float = 0.0
+    stop_word_reset_pending_log: bool = False
 
     def save_preferences(self) -> None:
         """Save preferences as JSON."""

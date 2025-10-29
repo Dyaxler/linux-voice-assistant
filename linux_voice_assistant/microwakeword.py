@@ -41,6 +41,8 @@ class MicroWakeWord(TfLiteWakeWord):
         self.tflite_model = tflite_model
         self._probability_cutoff = float(probability_cutoff)
         self.sliding_window_size = sliding_window_size
+        self._probability_enabled = True
+        self._last_score_above_cutoff = False
         self.trained_languages = trained_languages
 
         self.is_active = True
@@ -109,26 +111,11 @@ class MicroWakeWord(TfLiteWakeWord):
             return False
 
         # Allocate and quantize input data
-        feature_window = np.concatenate(self._features, axis=1).astype(np.float32)
-        feature_window = np.nan_to_num(
-            feature_window, nan=0.0, posinf=0.0, neginf=0.0
-        )
-
-        input_scale = self.input_scale
-        if not np.isfinite(input_scale) or input_scale <= 0:
-            LOGGER.warning("Invalid input scale %s; defaulting to 1.0", input_scale)
-            input_scale = 1.0
-
-        input_zero_point = self.input_zero_point
-        if not np.isfinite(input_zero_point):
-            LOGGER.warning(
-                "Invalid input zero point %s; defaulting to 0", input_zero_point
-            )
-            input_zero_point = 0.0
-
-        quant_features = np.round(feature_window / input_scale + input_zero_point)
-        np.clip(quant_features, 0, np.iinfo(np.uint8).max, out=quant_features)
-        quant_features = quant_features.astype(np.uint8)
+        with np.errstate(invalid="ignore"):
+            quant_features = np.round(
+                np.concatenate(self._features, axis=1) / self.input_scale
+                + self.input_zero_point
+            ).astype(np.uint8)
 
         # Stride instead of rolling
         self._features.clear()
@@ -158,19 +145,56 @@ class MicroWakeWord(TfLiteWakeWord):
 
         self._probabilities.append(result.item())
 
-        if len(self._probabilities) < self.sliding_window_size:
-            # Not enough probabilities
-            return False
+        if self._probability_enabled:
+            if len(self._probabilities) < self.sliding_window_size:
+                self._last_score_above_cutoff = False
+                return False
 
-        if statistics.mean(self._probabilities) > self._probability_cutoff:
-            return True
+            score = statistics.mean(self._probabilities)
+            threshold = self._probability_cutoff
+        else:
+            if not self._probabilities:
+                self._last_score_above_cutoff = False
+                return False
 
-        return False
+            score = max(self._probabilities)
+            threshold = 0.0
+
+        above_cutoff = score > threshold
+        triggered = above_cutoff and not self._last_score_above_cutoff
+        self._last_score_above_cutoff = above_cutoff
+
+        return triggered
 
     def set_probability_cutoff(self, probability_cutoff: float) -> None:
         """Update the probability cutoff used for activation."""
 
         self._probability_cutoff = max(0.0, min(1.0, float(probability_cutoff)))
+        self._last_score_above_cutoff = False
+
+    def use_probability(self, enabled: bool) -> None:
+        """Enable or disable the probability threshold gate."""
+
+        self._probability_enabled = bool(enabled)
+        self._last_score_above_cutoff = False
+
+    def set_sliding_window_size(self, sliding_window_size: int) -> None:
+        """Update the size of the sliding probability window."""
+
+        size = max(1, int(sliding_window_size))
+        if size == self.sliding_window_size:
+            return
+
+        self.sliding_window_size = size
+        self._probabilities = deque(self._probabilities, maxlen=self.sliding_window_size)
+        self._last_score_above_cutoff = False
+
+    def reset(self) -> None:
+        """Clear any buffered features and probability history."""
+
+        self._features.clear()
+        self._probabilities.clear()
+        self._last_score_above_cutoff = False
 
     def get_probability_cutoff(self) -> float:
         """Return the current probability cutoff."""

@@ -5,6 +5,7 @@ import json
 import logging
 import signal
 import threading
+import time
 from contextlib import suppress
 from pathlib import Path
 from queue import Queue
@@ -242,6 +243,18 @@ async def main() -> None:
     stop_model = MicroWakeWord.from_config(
         stop_config_path, libtensorflowlite_c_path
     )
+    stop_model.use_probability(True)
+    stop_model.set_probability_cutoff(
+        max(stop_model.get_probability_cutoff(), _STOP_WORD_PROBABILITY_CUTOFF)
+    )
+    stop_model.set_sliding_window_size(_STOP_WORD_SLIDING_WINDOW_SIZE)
+    stop_model.use_probability(True)
+    stop_model.reset()
+    _LOGGER.debug(
+        "Configured stop model sensitivity (cutoff=%.2f, window=%d)",
+        stop_model.get_probability_cutoff(),
+        stop_model.sliding_window_size,
+    )
 
     state = ServerState(
         name=args.name,
@@ -365,6 +378,12 @@ async def main() -> None:
 # -----------------------------------------------------------------------------
 
 
+_STOP_WORD_EVENT_HOLD_SECONDS = 0.35
+_STOP_WORD_COOLDOWN_SECONDS = 0.75
+_STOP_WORD_PROBABILITY_CUTOFF = 0.5
+_STOP_WORD_SLIDING_WINDOW_SIZE = 3
+
+
 def process_audio(state: ServerState):
     """Process audio chunks from the microphone."""
 
@@ -445,8 +464,47 @@ def process_audio(state: ServerState):
                     if state.stop_word.process_streaming(micro_input):
                         stopped = True
 
-                if stopped and state.stop_word.is_active and not state.muted:
-                    state.satellite.stop()
+                now = time.monotonic()
+
+                if stopped:
+                    state.stop_word_last_detection = now
+                    state.stop_word_reset_pending_log = True
+                    if state.muted:
+                        _LOGGER.info(
+                            "Stop word detected while muted; ignoring trigger"
+                        )
+                        state.stop_word.reset()
+                        state.stop_word_event_active = True
+                        continue
+
+                    if not state.stop_word.is_active:
+                        _LOGGER.debug(
+                            "Stop word detected while handler inactive; forwarding"
+                        )
+
+                    if now < state.stop_word_cooldown_until:
+                        state.stop_word.reset()
+                        state.stop_word_event_active = True
+                        continue
+
+                    if not state.stop_word_event_active:
+                        _LOGGER.info("Stop word detected; requesting cancellation")
+                        state.satellite.stop()
+                        state.stop_word_cooldown_until = (
+                            now + _STOP_WORD_COOLDOWN_SECONDS
+                        )
+
+                    state.stop_word.reset()
+                    state.stop_word_event_active = True
+                else:
+                    if state.stop_word_event_active:
+                        time_since_detection = now - state.stop_word_last_detection
+                        if time_since_detection >= _STOP_WORD_EVENT_HOLD_SECONDS:
+                            state.stop_word.reset()
+                            state.stop_word_event_active = False
+                            if state.stop_word_reset_pending_log:
+                                _LOGGER.info("Stop word detector reset after cooldown")
+                                state.stop_word_reset_pending_log = False
             except Exception:
                 _LOGGER.exception("Unexpected error handling audio")
 
