@@ -50,6 +50,7 @@ See `--help` for more options.
 ### Microphone
 
 Use `--audio-input-device` to change the microphone device. Use `python3 -m sounddevice` to see the available PortAudio devices.
+(Occasionally you'll need to use the full path: `/opt/linux-voice-assistant/.venv/bin/python3 -m sounddevice`).
 
 The microphone device **must** support 16Khz mono audio.
 
