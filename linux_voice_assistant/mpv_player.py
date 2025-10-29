@@ -36,6 +36,8 @@ class MpvMediaPlayer:
         done_callback: Optional[Callable[[], None]] = None,
         stop_first: bool = True,
     ) -> None:
+        """Start playing ``url`` and register an optional callback."""
+
         self.stop()
 
         if isinstance(url, str):
@@ -82,7 +84,6 @@ class MpvMediaPlayer:
         volume = max(0, min(100, volume))
         self.player.volume = volume
 
-        self._unduck_volume = volume
         self._unduck_volume = volume
         self._duck_volume = self._compute_duck_volume()
 
