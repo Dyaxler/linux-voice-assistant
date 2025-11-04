@@ -14,6 +14,7 @@ from typing import List, Optional, Union
 import numpy as np
 import sounddevice as sd
 
+from . import api_server
 from .microwakeword import MicroWakeWord, MicroWakeWordFeatures
 from .models import NO_WAKE_WORD_NAME, Preferences, ServerState, WakeWordType
 from .mpv_player import MpvMediaPlayer
@@ -88,12 +89,18 @@ async def main() -> None:
     parser.add_argument(
         "--debug", action="store_true", help="Print DEBUG messages to console"
     )
+    parser.add_argument(
+        "--network",
+        action="store_true",
+        help="Include verbose network keepalive logging",
+    )
     args, unknown_args = parser.parse_known_args()
 
     if unknown_args:
         _LOGGER.debug("Ignoring unknown arguments: %s", unknown_args)
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    api_server.set_network_logging_enabled(args.network)
     _LOGGER.debug(args)
 
     wake_word_libraries = discover_wake_word_libraries(_WAKEWORDS_DIR)
@@ -380,8 +387,8 @@ async def main() -> None:
 
 _STOP_WORD_EVENT_HOLD_SECONDS = 0.35
 _STOP_WORD_COOLDOWN_SECONDS = 0.75
-_STOP_WORD_PROBABILITY_CUTOFF = 0.5
-_STOP_WORD_SLIDING_WINDOW_SIZE = 3
+_STOP_WORD_PROBABILITY_CUTOFF = 0.8
+_STOP_WORD_SLIDING_WINDOW_SIZE = 6
 
 
 def process_audio(state: ServerState):

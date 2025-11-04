@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import socket
+import time
 import threading
 from abc import abstractmethod
 from collections.abc import Iterable
@@ -27,6 +29,21 @@ PROTO_TO_MESSAGE_TYPE = {v: k for k, v in MESSAGE_TYPE_TO_PROTO.items()}
 _LOGGER = logging.getLogger(__name__)
 
 
+_NETWORK_LOGGING_ENABLED = False
+
+
+def set_network_logging_enabled(enabled: bool) -> None:
+    """Enable or disable verbose network logging."""
+
+    global _NETWORK_LOGGING_ENABLED
+    _NETWORK_LOGGING_ENABLED = enabled
+
+
+def _network_debug(message: str, *args, **kwargs) -> None:
+    if _NETWORK_LOGGING_ENABLED:
+        _LOGGER.debug(message, *args, **kwargs)
+
+
 class APIServer(asyncio.Protocol):
 
     def __init__(self, name: str) -> None:
@@ -39,6 +56,8 @@ class APIServer(asyncio.Protocol):
         self._writelines = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._loop_thread_id: Optional[int] = None
+        self._peername: Optional[object] = None
+        self._last_ping_monotonic: Optional[float] = None
 
     @abstractmethod
     def handle_message(self, msg: message.Message) -> Iterable[message.Message]:
@@ -70,7 +89,20 @@ class APIServer(asyncio.Protocol):
                 self._transport = None
                 self._writelines = None
         elif isinstance(msg_inst, PingRequest):
+            peer_display = self._peername if self._peername is not None else "<unknown peer>"
+            previous_ping = self._last_ping_monotonic
+            now = time.monotonic()
+            self._last_ping_monotonic = now
+            if previous_ping is None:
+                _network_debug("Received keepalive ping from %s (first ping)", peer_display)
+            else:
+                _network_debug(
+                    "Received keepalive ping from %s (%.3fs since last)",
+                    peer_display,
+                    now - previous_ping,
+                )
             self.send_messages([PingResponse()])
+            _network_debug("Sent keepalive pong to %s", peer_display)
         elif msgs := self.handle_message(msg_inst):
             if isinstance(msgs, message.Message):
                 msgs = [msgs]
@@ -100,6 +132,39 @@ class APIServer(asyncio.Protocol):
     def connection_made(self, transport) -> None:
         self._transport = transport
         self._writelines = transport.writelines
+        self._last_ping_monotonic = None
+        sock = transport.get_extra_info("socket")
+        if sock is not None:
+            peername = transport.get_extra_info("peername")
+            self._peername = peername
+            _network_debug("Configuring TCP keepalive for connection %s", peername)
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                _network_debug("Failed to enable TCP keepalive", exc_info=True)
+            else:
+                _network_debug("Enabled TCP keepalive")
+                for attr_name, level, option, value in (
+                    ("TCP_KEEPIDLE", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPIDLE", None), 60),
+                    ("TCP_KEEPINTVL", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", None), 10),
+                    ("TCP_KEEPCNT", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", None), 3),
+                ):
+                    if option is None:
+                        _network_debug(
+                            "Skipping TCP keepalive option %s; not supported on this platform",
+                            attr_name,
+                        )
+                        continue
+                    try:
+                        sock.setsockopt(level, option, value)
+                    except OSError:
+                        _network_debug(
+                            "Failed to set TCP keepalive option %s=%s", attr_name, value, exc_info=True
+                        )
+                    else:
+                        _network_debug(
+                            "Set TCP keepalive option %s=%s", attr_name, value
+                        )
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -157,10 +222,30 @@ class APIServer(asyncio.Protocol):
         return cstr[original_pos:new_pos]
 
     def connection_lost(self, exc):
+        peer_display = self._peername if self._peername is not None else "<unknown peer>"
+        if self._last_ping_monotonic is None:
+            last_ping_text = "never"
+        else:
+            last_ping_text = f"{time.monotonic() - self._last_ping_monotonic:.3f}s ago"
+        if exc is None:
+            _LOGGER.debug(
+                "Connection lost with %s (last ping %s)",
+                peer_display,
+                last_ping_text,
+            )
+        else:
+            _LOGGER.debug(
+                "Connection lost with %s due to %s (last ping %s)",
+                peer_display,
+                exc,
+                last_ping_text,
+            )
         self._transport = None
         self._writelines = None
         self._loop = None
         self._loop_thread_id = None
+        self._peername = None
+        self._last_ping_monotonic = None
 
     def _read_varuint(self) -> int:
         """Read a varuint from the buffer or -1 if the buffer runs out of bytes."""
