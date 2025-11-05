@@ -33,15 +33,24 @@ _NETWORK_LOGGING_ENABLED = False
 
 
 def set_network_logging_enabled(enabled: bool) -> None:
-    """Enable or disable verbose network logging."""
+    """Enable or disable verbose network logging without affecting keepalive handling."""
 
     global _NETWORK_LOGGING_ENABLED
     _NETWORK_LOGGING_ENABLED = enabled
 
 
-def _network_debug(message: str, *args, **kwargs) -> None:
-    if _NETWORK_LOGGING_ENABLED:
-        _LOGGER.debug(message, *args, **kwargs)
+def _network_log(message: str, *args, **kwargs) -> None:
+    """Log network messages when network tracing is enabled."""
+
+    if not _NETWORK_LOGGING_ENABLED:
+        return
+
+    if _LOGGER.isEnabledFor(logging.DEBUG):
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+
+    _LOGGER.log(level, message, *args, **kwargs)
 
 
 class APIServer(asyncio.Protocol):
@@ -94,15 +103,15 @@ class APIServer(asyncio.Protocol):
             now = time.monotonic()
             self._last_ping_monotonic = now
             if previous_ping is None:
-                _network_debug("Received keepalive ping from %s (first ping)", peer_display)
+                _network_log("Received keepalive ping from %s (first ping)", peer_display)
             else:
-                _network_debug(
+                _network_log(
                     "Received keepalive ping from %s (%.3fs since last)",
                     peer_display,
                     now - previous_ping,
                 )
             self.send_messages([PingResponse()])
-            _network_debug("Sent keepalive pong to %s", peer_display)
+            _network_log("Sent keepalive pong to %s", peer_display)
         elif msgs := self.handle_message(msg_inst):
             if isinstance(msgs, message.Message):
                 msgs = [msgs]
@@ -137,20 +146,20 @@ class APIServer(asyncio.Protocol):
         if sock is not None:
             peername = transport.get_extra_info("peername")
             self._peername = peername
-            _network_debug("Configuring TCP keepalive for connection %s", peername)
+            _network_log("Configuring TCP keepalive for connection %s", peername)
             try:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             except OSError:
-                _network_debug("Failed to enable TCP keepalive", exc_info=True)
+                _network_log("Failed to enable TCP keepalive", exc_info=True)
             else:
-                _network_debug("Enabled TCP keepalive")
+                _network_log("Enabled TCP keepalive")
                 for attr_name, level, option, value in (
                     ("TCP_KEEPIDLE", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPIDLE", None), 60),
                     ("TCP_KEEPINTVL", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPINTVL", None), 10),
                     ("TCP_KEEPCNT", socket.IPPROTO_TCP, getattr(socket, "TCP_KEEPCNT", None), 3),
                 ):
                     if option is None:
-                        _network_debug(
+                        _network_log(
                             "Skipping TCP keepalive option %s; not supported on this platform",
                             attr_name,
                         )
@@ -158,11 +167,11 @@ class APIServer(asyncio.Protocol):
                     try:
                         sock.setsockopt(level, option, value)
                     except OSError:
-                        _network_debug(
+                        _network_log(
                             "Failed to set TCP keepalive option %s=%s", attr_name, value, exc_info=True
                         )
                     else:
-                        _network_debug(
+                        _network_log(
                             "Set TCP keepalive option %s=%s", attr_name, value
                         )
         try:

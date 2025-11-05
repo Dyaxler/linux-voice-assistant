@@ -92,7 +92,7 @@ async def main() -> None:
     parser.add_argument(
         "--network",
         action="store_true",
-        help="Include verbose network keepalive logging",
+        help="Include verbose network keepalive logging without requiring --debug",
     )
     args, unknown_args = parser.parse_known_args()
 
