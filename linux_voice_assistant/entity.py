@@ -58,6 +58,9 @@ class MediaPlayerEntity(ESPHomeEntity):
         object_id: str,
         music_player: MpvMediaPlayer,
         announce_player: MpvMediaPlayer,
+        *,
+        initial_volume: float = 1.0,
+        on_volume_changed: Optional[Callable[[float], None]] = None,
     ) -> None:
         ESPHomeEntity.__init__(self, server)
 
@@ -70,6 +73,9 @@ class MediaPlayerEntity(ESPHomeEntity):
         self.previous_volume = 1.0
         self.music_player = music_player
         self.announce_player = announce_player
+        self._on_volume_changed = on_volume_changed
+
+        self.apply_volume_from_state(initial_volume)
 
     def play(
         self,
@@ -151,23 +157,16 @@ class MediaPlayerEntity(ESPHomeEntity):
                 elif command == MediaPlayerCommand.MUTE:
                     if not self.muted:
                         self.previous_volume = self.volume
-                        self.volume = 0
-                        self.music_player.set_volume(0)
-                        self.announce_player.set_volume(0)
+                        self._apply_volume(0.0, persist=False, remember=False)
                         self.muted = True
                     yield self._update_state(self.state)
                 elif command == MediaPlayerCommand.UNMUTE:
                     if self.muted:
-                        self.volume = self.previous_volume
-                        self.music_player.set_volume(int(self.volume * 100))
-                        self.announce_player.set_volume(int(self.volume * 100))
+                        self._apply_volume(self.previous_volume, persist=True)
                         self.muted = False
                     yield self._update_state(self.state)
             elif msg.has_volume:
-                volume = int(msg.volume * 100)
-                self.music_player.set_volume(volume)
-                self.announce_player.set_volume(volume)
-                self.volume = msg.volume
+                self._apply_volume(msg.volume, persist=True)
                 yield self._update_state(self.state)
         elif isinstance(msg, ListEntitiesRequest):
             yield ListEntitiesMediaPlayerResponse(
@@ -200,6 +199,48 @@ class MediaPlayerEntity(ESPHomeEntity):
             return MediaPlayerState.PAUSED
 
         return MediaPlayerState.IDLE
+
+    def apply_volume_from_state(self, volume: float) -> None:
+        """Synchronize the local volume with the stored state without persisting."""
+
+        clamped = max(0.0, min(1.0, float(volume)))
+
+        if self.muted:
+            self.previous_volume = clamped
+            return
+
+        self._apply_volume(clamped, persist=False)
+
+    def sync_state(self) -> MediaPlayerStateResponse:
+        """Update the cached state based on the underlying players."""
+
+        return self._update_state(self._determine_state())
+
+    def set_volume_callback(self, callback: Optional[Callable[[float], None]]) -> None:
+        """Update the callback invoked when the volume changes."""
+
+        self._on_volume_changed = callback
+
+    def _apply_volume(
+        self,
+        volume: float,
+        *,
+        persist: bool,
+        remember: bool = True,
+    ) -> None:
+        normalized = max(0.0, min(1.0, float(volume)))
+        volume_percent = int(round(normalized * 100))
+
+        self.music_player.set_volume(volume_percent)
+        self.announce_player.set_volume(volume_percent)
+
+        self.volume = normalized
+
+        if remember:
+            self.previous_volume = normalized
+
+        if self._on_volume_changed and persist:
+            self._on_volume_changed(normalized)
 
 
 # -----------------------------------------------------------------------------

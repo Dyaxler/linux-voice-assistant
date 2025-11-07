@@ -23,6 +23,7 @@ class MpvMediaPlayer:
         self._playlist: List[str] = []
         self._done_callback: Optional[Callable[[], None]] = None
         self._done_callback_lock = Lock()
+        self._pending_stop_events = 0
 
         self._duck_volume: int = 50
         self._unduck_volume: int = 100
@@ -68,6 +69,14 @@ class MpvMediaPlayer:
             self.is_playing = False
 
     def stop(self) -> None:
+        was_active = self.is_playing or self.is_paused or self._playlist
+
+        with self._done_callback_lock:
+            self._done_callback = None
+
+        if was_active:
+            self._pending_stop_events += 1
+
         self.player.stop()
         self._playlist.clear()
         self.is_playing = False
@@ -87,6 +96,10 @@ class MpvMediaPlayer:
         self._duck_volume = volume // 2
 
     def _on_end_file(self, event) -> None:
+        if self._pending_stop_events:
+            self._pending_stop_events -= 1
+            return
+
         if self._playlist:
             self.player.play(self._playlist.pop(0))
             return

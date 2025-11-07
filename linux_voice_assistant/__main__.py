@@ -16,7 +16,13 @@ import soundcard as sc
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures
 from pyopen_wakeword import OpenWakeWord, OpenWakeWordFeatures
 
-from .models import AvailableWakeWord, Preferences, ServerState, WakeWordType
+from .models import (
+    AvailableWakeWord,
+    Preferences,
+    ServerState,
+    StopWordFilter,
+    WakeWordType,
+)
 from .mpv_player import MpvMediaPlayer
 from .satellite import VoiceSatelliteProtocol
 from .util import get_mac
@@ -79,12 +85,6 @@ async def main() -> None:
         help="Id of stop model (default: stop)"
     )
     parser.add_argument(
-        "--refractory-seconds",
-        default=2.0,
-        type=float,
-        help="Seconds before wake word can be activated again (default: 2.0)"
-    )
-    parser.add_argument(
         "--wakeup-sound",
         default=str(_SOUNDS_DIR / "wake_word_triggered.flac"),
         help="Directory and file name for wake sound (default: wake_word_triggered.flac)"
@@ -115,7 +115,10 @@ async def main() -> None:
         action="store_true",
         help="Print DEBUG messages to console"
     )
-    args = parser.parse_args()
+    args, unknown_args = parser.parse_known_args()
+
+    if unknown_args:
+        _LOGGER.debug("Ignoring unrecognized arguments: %s", unknown_args)
 
     if len(sys.argv) == 1:
         parser.print_help()
@@ -195,6 +198,33 @@ async def main() -> None:
     else:
         preferences = Preferences()
 
+    stored_media_volume = getattr(preferences, "media_volume", 1.0)
+    try:
+        stored_media_volume = float(stored_media_volume)
+    except (TypeError, ValueError):
+        stored_media_volume = 1.0
+
+    stored_media_volume = max(0.0, min(1.0, stored_media_volume))
+    if preferences.media_volume != stored_media_volume:
+        _LOGGER.debug(
+            "Clamping stored media volume %.3f to %.3f", preferences.media_volume, stored_media_volume
+        )
+        preferences.media_volume = stored_media_volume
+
+    initial_volume_percent = int(round(stored_media_volume * 100))
+
+    music_player = MpvMediaPlayer(device=args.audio_output_device)
+    tts_player = MpvMediaPlayer(device=args.audio_output_device)
+
+    music_player.set_volume(initial_volume_percent)
+    tts_player.set_volume(initial_volume_percent)
+
+    _LOGGER.debug(
+        "Applied stored media volume %.3f (%d%%) to media players",
+        stored_media_volume,
+        initial_volume_percent,
+    )
+
     # Load wake/stop models
     active_wake_words: Set[str] = set()
     wake_models: Dict[str, Union[MicroWakeWord, OpenWakeWord]] = {}
@@ -241,13 +271,14 @@ async def main() -> None:
         wake_words=wake_models,
         active_wake_words=active_wake_words,
         stop_word=stop_model,
-        music_player=MpvMediaPlayer(device=args.audio_output_device),
-        tts_player=MpvMediaPlayer(device=args.audio_output_device),
+        stop_filter=StopWordFilter(),
+        music_player=music_player,
+        tts_player=tts_player,
         wakeup_sound=args.wakeup_sound,
         timer_finished_sound=args.timer_finished_sound,
         preferences=preferences,
         preferences_path=preferences_path,
-        refractory_seconds=args.refractory_seconds,
+        media_volume=stored_media_volume,
     )
 
     loop = asyncio.get_running_loop()
@@ -283,6 +314,8 @@ async def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        if state.satellite is not None:
+            state.satellite.reset_pipeline("shutdown", notify=False)
         state.audio_queue.put_nowait(None)
         process_audio_thread.join()
 
@@ -302,8 +335,6 @@ def process_audio(state: ServerState, mic, block_size: int):
     oww_features: Optional[OpenWakeWordFeatures] = None
     oww_inputs: List[np.ndarray] = []
     has_oww = False
-
-    last_active: Optional[float] = None
 
     try:
         _LOGGER.debug("Opening audio input device: %s", mic.name)
@@ -364,22 +395,31 @@ def process_audio(state: ServerState, mic, block_size: int):
                                         activated = True
 
                         if activated and not state.muted:
-                            # Check refractory
-                            now = time.monotonic()
-                            if (last_active is None) or (
-                                (now - last_active) > state.refractory_seconds
-                            ):
-                                state.satellite.wakeup(wake_word)
-                                last_active = now
+                            state.satellite.wakeup(wake_word)
 
                     # Always process to keep state correct
-                    stopped = False
-                    for micro_input in micro_inputs:
-                        if state.stop_word.process_streaming(micro_input):
-                            stopped = True
+                    stop_triggered = False
+                    if micro_inputs:
+                        for micro_input in micro_inputs:
+                            detected = bool(state.stop_word.process_streaming(micro_input))
+                            if state.stop_filter.observe(
+                                detected,
+                                now=time.monotonic(),
+                                logger=_LOGGER,
+                            ):
+                                stop_triggered = True
+                                break
+                    else:
+                        state.stop_filter.observe(False, now=time.monotonic())
 
-                    if stopped and (state.stop_word.id in state.active_wake_words) and not state.muted:
-                        state.satellite.stop()
+                    if stop_triggered:
+                        if state.muted:
+                            _LOGGER.debug(
+                                "Stop filter triggered while muted; ignoring detection"
+                            )
+                        else:
+                            _LOGGER.debug("Stop filter accepted detection; sending stop")
+                            state.satellite.stop()
                 except Exception:
                     _LOGGER.exception("Unexpected error handling audio")
     except Exception:
