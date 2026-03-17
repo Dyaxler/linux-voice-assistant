@@ -1,6 +1,9 @@
 """Voice satellite protocol."""
 
 import asyncio
+import os
+import signal
+import threading
 import hashlib
 import logging
 import posixpath
@@ -14,6 +17,7 @@ from urllib.request import urlopen
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
     AuthenticationRequest,
+    ButtonCommandRequest,
     DeviceInfoRequest,
     DeviceInfoResponse,
     ListEntitiesDoneResponse,
@@ -45,7 +49,15 @@ from pymicro_wakeword import MicroWakeWord
 from pyopen_wakeword import OpenWakeWord
 
 from .api_server import APIServer
-from .entity import MediaPlayerEntity, MuteSwitchEntity, ThinkingSoundEntity, WakeWordLibrarySelectEntity, WakeWordSensitivitySelectEntity
+from .entity import (
+    MediaPlayerEntity,
+    MuteSwitchEntity,
+    RestartButtonEntity,
+    ThinkingSoundEntity,
+    WakeWordLibrarySelectEntity,
+    WakeWordSensitivityNumberEntity,
+    WakeWordSensitivitySelectEntity,
+)
 from .models import AvailableWakeWord, ServerState, WakeWordType
 from .util import call_all
 
@@ -62,6 +74,7 @@ class VoiceSatelliteProtocol(APIServer):
         self.state = state
         self.state.satellite = self
         self.state.connected = False
+        self._api_server: Optional[asyncio.Server] = None
 
         existing_media_players = [entity for entity in self.state.entities if isinstance(entity, MediaPlayerEntity)]
         if existing_media_players:
@@ -178,33 +191,106 @@ class VoiceSatelliteProtocol(APIServer):
         wake_word_library_select.update_on_library_changed(self._on_wake_word_library_changed)
         wake_word_library_select.update_get_options(lambda: self._get_wake_word_library_options())
 
-        # Add/update wake word sensitivity select entity
-        existing_wake_word_sensitivity_selects = [e for e in self.state.entities if isinstance(e, WakeWordSensitivitySelectEntity)]
-        if existing_wake_word_sensitivity_selects:
-            self.state.wake_word_sensitivity_select_entity = existing_wake_word_sensitivity_selects[0]
-            for extra in existing_wake_word_sensitivity_selects[1:]:
+        # Add/update wake word sensitivity entity (Select or Number based on advanced mode)
+        if self.state.advanced_wake_word_sensitivity:
+            # Advanced mode: Use Number entity (0.0 - 1.0)
+            # Initialize to 0.9 if preference is missing
+            if self.state.preferences.wake_word_sensitivity is None:
+                self.state.preferences.wake_word_sensitivity = 0.9
+                self.state.save_preferences()
+
+            # Remove existing Select entity if present
+            existing_selects = [e for e in self.state.entities if isinstance(e, WakeWordSensitivitySelectEntity)]
+            for extra in existing_selects:
+                self.state.entities.remove(extra)
+            self.state.wake_word_sensitivity_select_entity = None
+
+            # Create Number entity
+            existing_numbers = [e for e in self.state.entities if isinstance(e, WakeWordSensitivityNumberEntity)]
+            if existing_numbers:
+                self.state.wake_word_sensitivity_number_entity = existing_numbers[0]
+                for extra in existing_numbers[1:]:
+                    self.state.entities.remove(extra)
+
+            wake_word_sensitivity_number = self.state.wake_word_sensitivity_number_entity
+            if wake_word_sensitivity_number is None:
+                wake_word_sensitivity_number = WakeWordSensitivityNumberEntity(
+                    server=self,
+                    key=len(state.entities),
+                    name="Wake word sensitivity",
+                    object_id="wake_word_sensitivity_advanced",
+                    get_sensitivity=lambda: self._get_sensitivity_numeric(),
+                    set_sensitivity=self._on_wake_word_sensitivity_numeric_set,
+                    on_sensitivity_changed=self._on_wake_word_sensitivity_changed,
+                )
+                self.state.entities.append(wake_word_sensitivity_number)
+                self.state.wake_word_sensitivity_number_entity = wake_word_sensitivity_number
+            elif wake_word_sensitivity_number not in self.state.entities:
+                self.state.entities.append(wake_word_sensitivity_number)
+
+            wake_word_sensitivity_number.server = self
+            wake_word_sensitivity_number.update_get_sensitivity(lambda: self._get_sensitivity_numeric())
+            wake_word_sensitivity_number.update_set_sensitivity(self._on_wake_word_sensitivity_numeric_set)
+            wake_word_sensitivity_number.update_on_sensitivity_changed(self._on_wake_word_sensitivity_changed)
+        else:
+            # Default mode: Use Select entity (presets)
+            # Remove existing Number entity if present
+            existing_numbers = [e for e in self.state.entities if isinstance(e, WakeWordSensitivityNumberEntity)]
+            for extra in existing_numbers:
+                self.state.entities.remove(extra)
+            self.state.wake_word_sensitivity_number_entity = None
+
+            # Create Select entity
+            existing_selects = [e for e in self.state.entities if isinstance(e, WakeWordSensitivitySelectEntity)]
+            if existing_selects:
+                self.state.wake_word_sensitivity_select_entity = existing_selects[0]
+                for extra in existing_selects[1:]:
+                    self.state.entities.remove(extra)
+
+            wake_word_sensitivity_select = self.state.wake_word_sensitivity_select_entity
+            if wake_word_sensitivity_select is None:
+                wake_word_sensitivity_select = WakeWordSensitivitySelectEntity(
+                    server=self,
+                    key=len(state.entities),
+                    name="Wake word sensitivity",
+                    object_id="wake_word_sensitivity",
+                    get_sensitivity=lambda: self._get_sensitivity_string(),
+                    set_sensitivity=self._on_wake_word_sensitivity_set,
+                    on_sensitivity_changed=self._on_wake_word_sensitivity_changed,
+                )
+                self.state.entities.append(wake_word_sensitivity_select)
+                self.state.wake_word_sensitivity_select_entity = wake_word_sensitivity_select
+            elif wake_word_sensitivity_select not in self.state.entities:
+                self.state.entities.append(wake_word_sensitivity_select)
+
+            wake_word_sensitivity_select.server = self
+            wake_word_sensitivity_select.update_get_sensitivity(lambda: self._get_sensitivity_string())
+            wake_word_sensitivity_select.update_set_sensitivity(self._on_wake_word_sensitivity_set)
+            wake_word_sensitivity_select.update_on_sensitivity_changed(self._on_wake_word_sensitivity_changed)
+
+        # Add/update restart button entity (always present)
+        existing_restart_buttons = [e for e in self.state.entities if isinstance(e, RestartButtonEntity)]
+        if existing_restart_buttons:
+            self.state.restart_button_entity = existing_restart_buttons[0]
+            for extra in existing_restart_buttons[1:]:
                 self.state.entities.remove(extra)
 
-        wake_word_sensitivity_select = self.state.wake_word_sensitivity_select_entity
-        if wake_word_sensitivity_select is None:
-            wake_word_sensitivity_select = WakeWordSensitivitySelectEntity(
+        restart_button = self.state.restart_button_entity
+        if restart_button is None:
+            restart_button = RestartButtonEntity(
                 server=self,
                 key=len(state.entities),
-                name="Wake word sensitivity",
-                object_id="wake_word_sensitivity",
-                get_sensitivity=lambda: self._get_sensitivity_string(),
-                set_sensitivity=self._on_wake_word_sensitivity_set,
-                on_sensitivity_changed=self._on_wake_word_sensitivity_changed,
+                name="Restart",
+                object_id="lva_restart",
+                on_restart_pressed=self._on_restart_pressed,
             )
-            self.state.entities.append(wake_word_sensitivity_select)
-            self.state.wake_word_sensitivity_select_entity = wake_word_sensitivity_select
-        elif wake_word_sensitivity_select not in self.state.entities:
-            self.state.entities.append(wake_word_sensitivity_select)
+            self.state.entities.append(restart_button)
+            self.state.restart_button_entity = restart_button
+        elif restart_button not in self.state.entities:
+            self.state.entities.append(restart_button)
 
-        wake_word_sensitivity_select.server = self
-        wake_word_sensitivity_select.update_get_sensitivity(lambda: self._get_sensitivity_string())
-        wake_word_sensitivity_select.update_set_sensitivity(self._on_wake_word_sensitivity_set)
-        wake_word_sensitivity_select.update_on_sensitivity_changed(self._on_wake_word_sensitivity_changed)
+        restart_button.server = self
+        restart_button.update_on_restart_pressed(self._on_restart_pressed)
 
         self._is_streaming_audio = False
         self._tts_url: Optional[str] = None
@@ -367,6 +453,94 @@ class VoiceSatelliteProtocol(APIServer):
         """Callback when wake word sensitivity changes - already applied in set method."""
         _LOGGER.debug("Wake word sensitivity change callback - already applied in set method")
 
+    def _get_sensitivity_numeric(self) -> float:
+        """Get numeric sensitivity value for Number entity."""
+        sensitivity = getattr(self.state.preferences, 'wake_word_sensitivity', None)
+        if sensitivity is None:
+            return 0.9  # Default to 0.9 for advanced mode
+        return float(sensitivity)
+
+    def _on_wake_word_sensitivity_numeric_set(self, sensitivity: float) -> None:
+        """Set wake word sensitivity from numeric value (0.0-1.0)."""
+        # Clamp to valid range
+        clamped = max(0.0, min(1.0, sensitivity))
+
+        # Save numeric value to preferences
+        self.state.preferences.wake_word_sensitivity = clamped
+        self.state.save_preferences()
+
+        # For advanced mode, the numeric value IS the probability cutoff
+        # Lower value = more sensitive (lower threshold to trigger)
+        # Higher value = less sensitive (higher threshold to trigger)
+        # This is the inverse of the preset behavior
+
+        # Apply to openWakeWord - use the numeric value directly as cutoff
+        # In advanced mode: 0.0 = very sensitive (triggers on anything)
+        # 1.0 = not sensitive at all (requires perfect match)
+        self.state.oww_probability_cutoff = clamped
+
+        # Apply to microWakeWord - use the same value
+        micro_overridden = 0
+        for wake_word in self.state.wake_words.values():
+            if isinstance(wake_word, MicroWakeWord):
+                wake_word.probability_cutoff = clamped
+                micro_overridden += 1
+
+        _LOGGER.info("Applied numeric sensitivity %.6f: openWakeWord cutoff=%.6f, microWakeWord overridden=%d",
+                     clamped, clamped, micro_overridden)
+
+    def _on_restart_pressed(self) -> None:
+        """Handle restart button press - gracefully exit to let systemd restart."""
+        _LOGGER.info("Restart button pressed - initiating graceful shutdown")
+
+        # Get current PID for watchdog and SIGTERM
+        pid = os.getpid()
+        _LOGGER.info("Current PID: %d", pid)
+
+        # Start watchdog timer - will send SIGKILL after 2 seconds if process doesn't exit
+        watchdog = threading.Timer(2.0, lambda: os.kill(pid, signal.SIGKILL))
+        watchdog.daemon = True
+        watchdog.start()
+        _LOGGER.info("Watchdog armed: will send SIGKILL in 2 seconds if process doesn't exit")
+
+        # Save any pending preferences (catch exceptions but continue)
+        try:
+            self.state.save_preferences()
+            _LOGGER.info("Preferences saved successfully")
+        except Exception as e:
+            _LOGGER.warning("Failed to save preferences: %s", e)
+
+        # Gracefully close the API server if available
+        async def close_server():
+            server = getattr(self, '_api_server', None)
+            if server and server.is_serving():
+                _LOGGER.info("Closing API server gracefully")
+                server.close()
+                try:
+                    await asyncio.wait_for(server.wait_closed(), timeout=0.5)
+                    _LOGGER.info("API server closed successfully")
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("Server close timed out after 0.5s")
+                except Exception as e:
+                    _LOGGER.warning("Error during server close: %s", e)
+            else:
+                _LOGGER.debug("No active server to close")
+
+        # Try to close the server in the event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # Create a task to close the server and schedule it
+            loop.call_soon_threadsafe(lambda: asyncio.create_task(close_server()))
+        except RuntimeError:
+            _LOGGER.debug("No running event loop, skipping async server close")
+        except Exception as e:
+            _LOGGER.warning("Failed to schedule server close: %s", e)
+
+        # Exit immediately with status 0 (normal) to avoid systemd failure exit-code logging
+        # The watchdog remains armed as a safety net
+        _LOGGER.info("Exiting immediately with status 0 (normal)")
+        os._exit(0)
+
     def handle_voice_event(self, event_type: VoiceAssistantEventType, data: Dict[str, str]) -> None:
         _LOGGER.debug("Voice event: type=%s, data=%s", event_type.name, data)
 
@@ -475,6 +649,13 @@ class VoiceSatelliteProtocol(APIServer):
                     break
         elif isinstance(msg, SwitchCommandRequest):
             # Route SwitchCommandRequest by key to matching entity only
+            msg_key = msg.key
+            for entity in self.state.entities:
+                if hasattr(entity, "key") and entity.key == msg_key:
+                    yield from entity.handle_message(msg)
+                    break
+        elif isinstance(msg, ButtonCommandRequest):
+            # Route ButtonCommandRequest by key to matching entity only
             msg_key = msg.key
             for entity in self.state.entities:
                 if hasattr(entity, "key") and entity.key == msg_key:
@@ -709,6 +890,7 @@ class VoiceSatelliteProtocol(APIServer):
 
         self.state.stop_word.is_active = False
         self.state.connected = False
+        self._api_server: Optional[asyncio.Server] = None
         if self.state.satellite is self:
             self.state.satellite = None
 

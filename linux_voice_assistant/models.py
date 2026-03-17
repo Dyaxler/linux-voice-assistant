@@ -16,8 +16,10 @@ if TYPE_CHECKING:
         ESPHomeEntity,
         MediaPlayerEntity,
         MuteSwitchEntity,
+        RestartButtonEntity,
         ThinkingSoundEntity,
         WakeWordLibrarySelectEntity,
+        WakeWordSensitivityNumberEntity,
         WakeWordSensitivitySelectEntity,
     )
     from .mpv_player import MpvMediaPlayer
@@ -98,12 +100,15 @@ class ServerState:
     thinking_sound_entity: "Optional[ThinkingSoundEntity]" = None
     wake_word_library_select_entity: "Optional[WakeWordLibrarySelectEntity]" = None
     wake_word_sensitivity_select_entity: "Optional[WakeWordSensitivitySelectEntity]" = None
+    wake_word_sensitivity_number_entity: "Optional[WakeWordSensitivityNumberEntity]" = None
+    restart_button_entity: "Optional[RestartButtonEntity]" = None
     oww_probability_cutoff: float = 0.5
     micro_default_cutoffs: Dict[str, float] = field(default_factory=dict)
     wake_words_changed: bool = False
     refractory_seconds: float = 2.0
     thinking_sound_enabled: bool = False
     muted: bool = False
+    advanced_wake_word_sensitivity: bool = False  # True = Number entity, False = Select entity
     connected: bool = False
     volume: float = 1.0
 

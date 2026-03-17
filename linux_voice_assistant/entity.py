@@ -5,12 +5,17 @@ from typing import Callable, List, Optional, Union
 
 # pylint: disable=no-name-in-module
 from aioesphomeapi.api_pb2 import (  # type: ignore[attr-defined]
+    ButtonCommandRequest,
+    ListEntitiesButtonResponse,
     ListEntitiesMediaPlayerResponse,
+    ListEntitiesNumberResponse,
     ListEntitiesRequest,
     ListEntitiesSelectResponse,
     ListEntitiesSwitchResponse,
     MediaPlayerCommandRequest,
     MediaPlayerStateResponse,
+    NumberCommandRequest,
+    NumberStateResponse,
     SubscribeHomeAssistantStatesRequest,
     SelectCommandRequest,
     SwitchCommandRequest,
@@ -22,6 +27,7 @@ from aioesphomeapi.model import (
     MediaPlayerCommand,
     MediaPlayerEntityFeature,
     MediaPlayerState,
+    NumberMode,
 )
 from google.protobuf import message
 
@@ -551,3 +557,116 @@ class WakeWordSensitivitySelectEntity(ESPHomeEntity):
     def get_oww_cutoff(sensitivity: str) -> float:
         """Get the openWakeWord probability cutoff for a given sensitivity level."""
         return WakeWordSensitivitySelectEntity.OWW_CUTOFF_MAP.get(sensitivity, 0.5)
+
+class WakeWordSensitivityNumberEntity(ESPHomeEntity):
+    """Number entity for advanced wake word sensitivity control (0.0-1.0)."""
+
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        get_sensitivity: "callable[[], float]",
+        set_sensitivity: "callable[[float], None]",
+        on_sensitivity_changed: "callable[[], None]",
+    ) -> None:
+        ESPHomeEntity.__init__(self, server)
+
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._get_sensitivity = get_sensitivity
+        self._set_sensitivity = set_sensitivity
+        self._on_sensitivity_changed = on_sensitivity_changed
+        self._log = logging.getLogger(f"{self.__class__.__name__}[{self.key}]")
+
+    def handle_message(self, msg: message.Message) -> "Iterable[message.Message]":
+        if isinstance(msg, NumberCommandRequest) and (msg.key == self.key):
+            new_value = msg.value
+            self._log.info("Wake word sensitivity change requested: %s", new_value)
+
+            # Clamp to valid range
+            clamped_value = max(0.0, min(1.0, new_value))
+            self._set_sensitivity(clamped_value)
+            self._log.info("Wake word sensitivity set to: %s", clamped_value)
+
+            # Trigger callback to apply sensitivity changes immediately
+            if self._on_sensitivity_changed:
+                self._on_sensitivity_changed()
+
+            # Return the new state
+            yield NumberStateResponse(key=self.key, state=clamped_value)
+
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesNumberResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                icon="mdi:volume-high",
+                min_value=0.0,
+                max_value=1.0,
+                step=0.000001,
+                mode=NumberMode.BOX,
+                entity_category=EntityCategory.CONFIG,
+            )
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            # Return current state
+            current_value = self._get_sensitivity()
+            yield NumberStateResponse(key=self.key, state=current_value)
+
+    def update_get_sensitivity(self, get_sensitivity: "callable[[], float]") -> None:
+        """Update the callback used to read the sensitivity state."""
+        self._get_sensitivity = get_sensitivity
+
+    def update_set_sensitivity(self, set_sensitivity: "callable[[float], None]") -> None:
+        """Update the callback used to change the sensitivity state."""
+        self._set_sensitivity = set_sensitivity
+
+    def update_on_sensitivity_changed(self, on_sensitivity_changed: "callable[[], None]") -> None:
+        """Update the callback invoked when the sensitivity changes."""
+        self._on_sensitivity_changed = on_sensitivity_changed
+
+
+class RestartButtonEntity(ESPHomeEntity):
+    """Button entity to trigger graceful service restart."""
+
+    def __init__(
+        self,
+        server: APIServer,
+        key: int,
+        name: str,
+        object_id: str,
+        on_restart_pressed: "callable[[], None]",
+    ) -> None:
+        ESPHomeEntity.__init__(self, server)
+
+        self.key = key
+        self.name = name
+        self.object_id = object_id
+        self._on_restart_pressed = on_restart_pressed
+        self._log = logging.getLogger(f"{self.__class__.__name__}[{self.key}]")
+
+    def handle_message(self, msg: message.Message) -> "Iterable[message.Message]":
+        if isinstance(msg, ButtonCommandRequest) and (msg.key == self.key):
+            self._log.info("Restart button pressed")
+
+            # Trigger restart callback
+            if self._on_restart_pressed:
+                self._on_restart_pressed()
+
+        elif isinstance(msg, ListEntitiesRequest):
+            yield ListEntitiesButtonResponse(
+                object_id=self.object_id,
+                key=self.key,
+                name=self.name,
+                icon="mdi:restart",
+                entity_category=EntityCategory.CONFIG,
+            )
+        elif isinstance(msg, SubscribeHomeAssistantStatesRequest):
+            # Button doesn't have state, but we still need to respond
+            pass
+
+    def update_on_restart_pressed(self, on_restart_pressed: "callable[[], None]") -> None:
+        """Update the callback invoked when the restart button is pressed."""
+        self._on_restart_pressed = on_restart_pressed

@@ -150,6 +150,11 @@ async def main() -> None:
         action="store_true",
         help="Add this to enable debug logging",
     )
+    parser.add_argument(
+        "--advanced-wake-word-sensitivity",
+        action="store_true",
+        help="Enable advanced wake word sensitivity (Number entity 0-1) instead of default Select entity",
+    )
     args = parser.parse_args()
 
     if args.list_input_devices:
@@ -283,6 +288,16 @@ async def main() -> None:
     else:
         preferences = Preferences()
 
+    # Filter available_wake_words based on wake_word_library preference
+    # This ensures that on startup/reconnect, the wake word options list matches
+    # the selected library (e.g., openWakeWord) rather than showing all libraries
+    wake_word_library = getattr(preferences, 'wake_word_library', None) or 'openWakeWord'
+    _LOGGER.debug("Filtering available wake words for library: %s", wake_word_library)
+    from .util import scan_wake_words_for_library
+    available_wake_words = scan_wake_words_for_library(wake_word_library, args.download_dir)
+    _LOGGER.debug("Filtered available wake words for library %s: %d models",
+                  wake_word_library, len(available_wake_words))
+
     # Convert wake_word_sensitivity from string to numeric if needed
     # String values: "Model default" -> None, "Slightly sensitive" -> 0.9, "Moderately sensitive" -> 0.7, "Very sensitive" -> 0.5
     if isinstance(preferences.wake_word_sensitivity, str):
@@ -391,6 +406,7 @@ async def main() -> None:
         download_dir=args.download_dir,
         micro_default_cutoffs=micro_default_cutoffs,
         volume=initial_volume,
+        advanced_wake_word_sensitivity=args.advanced_wake_word_sensitivity,
     )
 
     # Restore muted state from preferences if present
@@ -426,6 +442,10 @@ async def main() -> None:
             sensitivity_string = numeric_to_string.get(sensitivity_numeric, "Slightly sensitive")
             if state.satellite is not None:
                 state.satellite._on_wake_word_sensitivity_set(sensitivity_string)
+
+            # Store server reference in satellite for graceful restart
+            if state.satellite is not None:
+                state.satellite._api_server = server
 
             break  # connect successful, exit the loop
         except OSError as err:
